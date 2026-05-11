@@ -4,11 +4,15 @@ A developer documentation agent: point it at a GitHub repo, and ask questions ab
 
 ## Stack
 
-- **LLM**: [Claude API](https://platform.claude.com) — `claude-opus-4-7` via the official `anthropic` Python SDK.
-- **Embeddings**: `nomic-embed-text` running locally via [Ollama](https://ollama.com) — embeddings never leave the machine.
-- **Vector DB**: ChromaDB (persistent, stored in `./chroma_db`).
-- **GitHub API**: PyGithub.
-- **UI**: Streamlit.
+| Layer | Technology |
+|-------|-----------|
+| **LLM** | Any OpenAI-compatible model via [vLLM](https://github.com/vllm-project/vllm) — default `Qwen/Qwen2.5-7B-Instruct` |
+| **LLM client** | `openai` Python SDK with custom `base_url` (same pattern as rag-learning) |
+| **Embeddings** | `nomic-embed-text` running locally via [Ollama](https://ollama.com) — never leaves the machine |
+| **Vector DB** | ChromaDB (persistent, stored in `./chroma_db`) |
+| **GitHub API** | PyGithub |
+| **UI** | Streamlit |
+| **Background jobs** | [Inngest](https://www.inngest.com) via FastAPI — repo ingestion runs as a durable 2-step job; every agent run fires a monitoring event |
 
 No LangChain. No LlamaIndex. Everything is built from scratch.
 
@@ -39,12 +43,22 @@ Install Ollama from https://ollama.com, then:
 
 ```bash
 ollama pull nomic-embed-text
-ollama serve   # usually runs automatically after install
+ollama serve   # usually starts automatically after install
 ```
 
 The Ollama daemon must be running during both ingest and query — embeddings are computed locally.
 
-### 5. Configure environment variables
+### 5. Start a vLLM server
+
+Repomind talks to any OpenAI-compatible endpoint. Start a local vLLM server (or point at any hosted OpenAI-compatible API):
+
+```bash
+vllm serve Qwen/Qwen2.5-7B-Instruct --port 8001
+```
+
+Or deploy to Modal using `deploy/vllm_modal.py` (vestigial reference — update to match your model).
+
+### 6. Configure environment variables
 
 ```bash
 cp .env.example .env
@@ -52,37 +66,73 @@ cp .env.example .env
 
 Edit `.env` and fill in:
 
-- `ANTHROPIC_API_KEY` — your Claude API key from https://console.anthropic.com.
-- `GITHUB_TOKEN` — a GitHub personal access token with repo read access.
+| Variable | Description |
+|----------|-------------|
+| `VLLM_API_KEY` | API key for your vLLM server (can be any string for local servers) |
+| `VLLM_BASE_URL` | Base URL of the vLLM OpenAI-compatible endpoint, e.g. `http://localhost:8001/v1` |
+| `VLLM_MODEL` | Model name to use, e.g. `Qwen/Qwen2.5-7B-Instruct` |
+| `GITHUB_TOKEN` | GitHub personal access token with repo read access |
 
-### 6. Ingest a repository
+### 7. Start the FastAPI + Inngest backend
+
+The backend handles background ingestion jobs and agent run monitoring.
 
 ```bash
-python ingest.py <owner>/<repo> <ast|naive>
+# Terminal 1 — FastAPI + Inngest server
+uvicorn server:app --reload --port 8000
 ```
 
-- `ast` mode splits Python files at function / class boundaries and Markdown at H2 headings — the recommended mode.
-- `naive` mode uses fixed-size character chunks — useful as a baseline for the AST vs naive benchmark.
-
-This writes to a local ChromaDB collection named `<owner>_<repo>_<mode>` at `./chroma_db`.
-
-### 7. Launch the UI
+### 8. Start the Inngest Dev Server
 
 ```bash
+# Terminal 2 — Inngest Dev Server (UI at http://localhost:8288)
+npx inngest-cli@latest dev -u http://localhost:8000/api/inngest
+```
+
+Open http://localhost:8288 to monitor ingest jobs and agent runs step-by-step.
+
+### 9. Launch the Streamlit UI
+
+```bash
+# Terminal 3
 streamlit run app.py
 ```
 
-The UI has three tabs: **Chat** (ask the agent), **Logs** (recent activity, latency, token usage, and cost), **Benchmarks** (AST vs naive ranking + correctness pass rate).
+The UI has three tabs:
+- **Chat** — ask the agent questions about an ingested repo
+- **Logs** — recent activity, latency, token usage, and estimated cost
+- **Benchmarks** — AST vs naive chunking quality + correctness pass rate
 
-You can also drive the agent from the CLI:
+**Ingest a repo from the sidebar** — clicking "Ingest repo" triggers a background Inngest job (2 steps visible in the Dev UI: `fetch-and-chunk` → `embed-and-store`). The Streamlit sidebar returns immediately; watch progress at localhost:8288.
+
+### CLI usage (no server required)
 
 ```bash
+# Ingest directly (bypasses Inngest, useful for scripting)
+python ingest.py <owner>/<repo> <ast|naive>
+
+# Single agent query
 python agent.py <owner>_<repo>_<mode> "How does error handling work?"
+
+# Smoke-test tools against an ingested collection
+python tools.py <owner>_<repo>_<mode>
 ```
+
+## Inngest monitoring
+
+Three Inngest functions run in the background:
+
+| Function | Trigger | Steps |
+|----------|---------|-------|
+| `repomind/ingest_repo` | Sidebar "Ingest repo" button | `fetch-and-chunk` → `embed-and-store` |
+| `repomind/run_agent` | `POST /api/query` (async API path) | `agent-loop` |
+| `repomind/agent_completed` | After every Streamlit chat query | `compute-metrics` (cost, latency, tokens) |
+
+Inngest provides automatic retries, step-level error traces, and replay — visible at http://localhost:8288.
 
 ## Evaluation
 
-Two harnesses live in `eval/`.
+Three harnesses live in `eval/`.
 
 **Correctness** — runs a small fixed query set and checks each answer for must-contain / must-not-contain keywords:
 
@@ -92,7 +142,7 @@ python eval/test_queries.py <owner>_<repo>_<mode>
 
 Writes `eval_results.jsonl` (gitignored) and prints a pass rate.
 
-**AST vs naive benchmark** — retrieves top-N chunks from both modes for each of 8 benchmark queries and asks Claude (as judge) to rate each chunk 1–5:
+**AST vs naive benchmark** — retrieves top-N chunks from both modes for each of 8 benchmark queries and uses the LLM as judge to rate each chunk 1–5:
 
 ```bash
 python eval/compare.py <owner>/<repo>
@@ -106,23 +156,25 @@ Requires both `<owner>_<repo>_ast` and `<owner>_<repo>_naive` collections to be 
 python eval/metrics.py
 ```
 
-Reads `agent_logs.jsonl` and reports session counts, latency percentiles, token usage, and estimated Claude API spend.
+Reads `agent_logs.jsonl` and reports session counts, latency percentiles, token usage, and estimated LLM spend.
 
 ## Project layout
 
 ```
 repomind/
-├── ingest.py          # Fetch repo, chunk (AST or naive), embed, write to Chroma
-├── agent.py           # ReAct loop against the Claude API with tool dispatch
-├── tools.py           # Tool definitions (vector_search, get_file, get_recent_commits)
-├── prompts.py         # SYSTEM_PROMPT + QUERY_REWRITE_PROMPT
-├── logger.py          # Structured JSONL logging to agent_logs.jsonl
-├── app.py             # Streamlit UI (Chat / Logs / Benchmarks)
+├── server.py              # FastAPI + Inngest server (3 functions, 3 REST endpoints)
+├── inngest_setup.py       # Shared Inngest client singleton
+├── ingest.py              # Fetch repo, chunk (AST or naive), embed, write to Chroma
+├── agent.py               # ReAct loop via OpenAI SDK (vLLM-compatible) with tool dispatch
+├── tools.py               # Tool definitions (vector_search, get_file, get_recent_commits)
+├── prompts.py             # SYSTEM_PROMPT + QUERY_REWRITE_PROMPT
+├── logger.py              # Structured JSONL logging to agent_logs.jsonl
+├── app.py                 # Streamlit UI (Chat / Logs / Benchmarks)
 ├── deploy/
-│   └── vllm_modal.py      # Vestigial. Kept for reference only — not used.
+│   └── vllm_modal.py      # Reference Modal deployment for vLLM
 ├── eval/
 │   ├── test_queries.py    # Correctness test suite (keyword match / anti-match)
-│   ├── compare.py         # AST vs naive benchmark (Claude as judge)
+│   ├── compare.py         # AST vs naive benchmark (LLM as judge)
 │   └── metrics.py         # Per-session + aggregate metrics (latency, tokens, cost)
 ├── requirements.txt
 ├── .env.example
@@ -135,4 +187,9 @@ repomind/
 
 ## Pricing note
 
-The cost numbers surfaced in the Logs tab and by `eval/metrics.py` are estimated from the `claude-opus-4-7` list price (**$5 / M input, $25 / M output**, cached 2026-04-15). If pricing changes, edit `INPUT_PRICE_PER_M` / `OUTPUT_PRICE_PER_M` at the top of `eval/metrics.py`.
+Cost estimates in the Logs tab and `eval/metrics.py` default to **$0** for self-hosted/local models. To track spend for a hosted API, set in `.env`:
+
+```
+LLM_INPUT_PRICE_PER_M=0.50    # USD per 1M input tokens
+LLM_OUTPUT_PRICE_PER_M=1.50   # USD per 1M output tokens
+```

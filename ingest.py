@@ -1,6 +1,10 @@
 """Ingest a GitHub repo into ChromaDB with AST-based or naive chunking.
 
-Usage:
+Public API (used by Inngest steps in server.py):
+    fetch_and_chunk_repo(repo_slug, mode, event_id) -> dict
+    embed_and_store_chunks(chunks_data)             -> dict
+
+CLI usage (calls both functions sequentially):
     python ingest.py <owner/name> <ast|naive>
 """
 
@@ -8,11 +12,13 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import os
 import re
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 import chromadb
@@ -238,26 +244,132 @@ def embed(text: str) -> list[float]:
     return ollama.embeddings(model="nomic-embed-text", prompt=text)["embedding"]
 
 
+def fetch_and_chunk_repo(repo_slug: str, mode: str, event_id: str = "cli") -> dict:
+    """Step 1: Walk a GitHub repo, chunk every file, write to a temp JSONL on disk.
+
+    The temp file is named with *event_id* so Inngest retries are idempotent —
+    a retry of this step will overwrite the same file rather than producing a
+    duplicate.
+
+    Returns a small dict (safe to serialise as an Inngest step result):
+        {collection_name, temp_path, files_seen, total_chunks}
+    """
+    load_dotenv()
+    if repo_slug.count("/") != 1:
+        raise ValueError(f"repo must be 'owner/name'; got {repo_slug!r}")
+    owner, name = repo_slug.split("/", 1)
+
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN is not set. Add it to .env.")
+
+    gh = Github(auth=Auth.Token(token))
+    repo = gh.get_repo(repo_slug)
+
+    collection_name = f"{owner}_{name}_{mode}"
+    safe_event_id = event_id.replace("/", "-")[:40]
+    temp_path = str(Path("./chroma_db") / f".chunks_{collection_name}_{safe_event_id}.jsonl")
+    Path(temp_path).parent.mkdir(parents=True, exist_ok=True)
+
+    files_seen = 0
+    total_chunks = 0
+    with open(temp_path, "w", encoding="utf-8") as f:
+        for entry in walk_repo(gh, repo):
+            if os.path.splitext(entry.path)[1] not in ALLOWED_EXTS:
+                continue
+            data = fetch_file_bytes(gh, entry)
+            if data is None or is_binary(data):
+                continue
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            files_seen += 1
+            for chunk in chunk_file(entry.path, text, mode):
+                f.write(json.dumps({
+                    "id": chunk.chunk_id,
+                    "text": chunk.text,
+                    "metadata": chunk.metadata,
+                }) + "\n")
+                total_chunks += 1
+            if total_chunks % 50 == 0 and total_chunks:
+                print(f"[progress] {total_chunks} chunks chunked (last: {entry.path})", flush=True)
+
+    print(f"[fetch-and-chunk] {total_chunks} chunks from {files_seen} files → {temp_path}", flush=True)
+    return {
+        "collection_name": collection_name,
+        "temp_path": temp_path,
+        "files_seen": files_seen,
+        "total_chunks": total_chunks,
+    }
+
+
+def embed_and_store_chunks(chunks_data: dict) -> dict:
+    """Step 2: Read the temp JSONL from fetch_and_chunk_repo, embed, upsert ChromaDB.
+
+    The temp file is cleaned up in a finally block so a failed/retried step 2
+    can still find its input on retry (the file is only deleted on success).
+    """
+    collection_name: str = chunks_data["collection_name"]
+    temp_path: str = chunks_data["temp_path"]
+
+    client = chromadb.PersistentClient(path="./chroma_db")
+    collection = client.get_or_create_collection(collection_name)
+
+    total = 0
+    errors = 0
+    try:
+        with open(temp_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                try:
+                    vec = embed(chunk["text"])
+                except Exception as e:
+                    print(f"[warn] Embedding failed for {chunk['id']}: {e}", flush=True)
+                    errors += 1
+                    continue
+                collection.upsert(
+                    ids=[chunk["id"]],
+                    documents=[chunk["text"]],
+                    embeddings=[vec],
+                    metadatas=[chunk["metadata"]],
+                )
+                total += 1
+                if total % 50 == 0:
+                    print(f"[progress] {total} chunks embedded", flush=True)
+    finally:
+        # Only delete if the file exists — safe for retries (retry re-runs
+        # fetch-and-chunk first, which recreates the file before this step).
+        try:
+            Path(temp_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    print(
+        f"[embed-and-store] Done. {total} chunks stored, {errors} errors → '{collection_name}'",
+        flush=True,
+    )
+    return {
+        "collection_name": collection_name,
+        "total_chunks": total,
+        "files_seen": chunks_data.get("files_seen", 0),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ingest a GitHub repo into ChromaDB.")
     parser.add_argument("repo", help='Repo in "owner/name" form, e.g. facebook/react')
     parser.add_argument("mode", choices=["ast", "naive"], help="Chunking mode")
     args = parser.parse_args()
 
-    if args.repo.count("/") != 1:
-        print(f"Repo must be in 'owner/name' form; got {args.repo!r}", file=sys.stderr)
-        return 2
-    owner, name = args.repo.split("/", 1)
-
-    load_dotenv()
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        print("GITHUB_TOKEN is not set. Add it to .env.", file=sys.stderr)
-        return 2
-
-    gh = Github(auth=Auth.Token(token))
     try:
-        repo = gh.get_repo(args.repo)
+        chunks_data = fetch_and_chunk_repo(args.repo, args.mode, event_id="cli")
+    except (ValueError, RuntimeError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
     except GithubException as e:
         if e.status == 404:
             print(
@@ -283,51 +395,10 @@ def main() -> int:
             print(f"Failed to open repo {args.repo!r}: {e}", file=sys.stderr)
         return 1
 
-    client = chromadb.PersistentClient(path="./chroma_db")
-    collection_name = f"{owner}_{name}_{args.mode}"
-    collection = client.get_or_create_collection(collection_name)
-
-    total = 0
-    files_seen = 0
-    for entry in walk_repo(gh, repo):
-        if os.path.splitext(entry.path)[1] not in ALLOWED_EXTS:
-            continue
-        data = fetch_file_bytes(gh, entry)
-        if data is None or is_binary(data):
-            continue
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-
-        files_seen += 1
-        chunks = chunk_file(entry.path, text, args.mode)
-        if not chunks:
-            continue
-
-        ids: list[str] = []
-        docs: list[str] = []
-        vecs: list[list[float]] = []
-        metas: list[dict] = []
-        for chunk in chunks:
-            try:
-                vec = embed(chunk.text)
-            except Exception as e:
-                print(f"[warn] Embedding failed for {chunk.chunk_id}: {e}", flush=True)
-                continue
-            ids.append(chunk.chunk_id)
-            docs.append(chunk.text)
-            vecs.append(vec)
-            metas.append(chunk.metadata)
-            total += 1
-            if total % 10 == 0:
-                print(f"[progress] {total} chunks ingested (last: {entry.path})", flush=True)
-        if ids:
-            collection.upsert(ids=ids, documents=docs, embeddings=vecs, metadatas=metas)
-
+    result = embed_and_store_chunks(chunks_data)
     print(
-        f"\nDone. Ingested {total} chunks from {files_seen} files "
-        f"into collection '{collection_name}'."
+        f"\nDone. Ingested {result['total_chunks']} chunks from "
+        f"{result['files_seen']} files into collection '{result['collection_name']}'."
     )
     return 0
 

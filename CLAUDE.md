@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-`ingest.py`, `tools.py`, `prompts.py`, `logger.py`, and `agent.py` are implemented. `app.py` and `eval/*.py` are still empty scaffolds. When adding code, conform to the module responsibilities described below rather than inventing a new layout.
+All core modules are implemented: `ingest.py`, `tools.py`, `prompts.py`, `logger.py`, `agent.py`, `app.py`, `eval/*.py`. Inngest-based monitoring is active via `server.py` and `inngest_setup.py`. When adding features, conform to the module responsibilities below.
 
 ## Commands
 
@@ -17,7 +17,17 @@ pip install -r requirements.txt
 ollama pull nomic-embed-text
 cp .env.example .env   # fill in ANTHROPIC_API_KEY, GITHUB_TOKEN
 
-# Build the local vector index (writes to ./chroma_db)
+# Terminal 1 — FastAPI + Inngest backend (required for Streamlit ingestion)
+uvicorn server:app --reload --port 8000
+
+# Terminal 2 — Inngest Dev Server (UI at http://localhost:8288)
+npx inngest-cli@latest dev -u http://localhost:8000/api/inngest
+
+# Terminal 3 — Streamlit UI
+streamlit run app.py
+
+# ── Standalone CLI (no server required) ──────────────────────────────────
+# Build the local vector index directly (bypasses Inngest)
 python ingest.py <owner/repo> <ast|naive>
 
 # Smoke-test the tools against an ingested collection
@@ -25,9 +35,6 @@ python tools.py <owner>_<repo>_<mode>
 
 # Run a single agent query from the CLI
 python agent.py <owner>_<repo>_<mode> "your question here"
-
-# Run the Streamlit UI
-streamlit run app.py
 ```
 
 No test runner, linter, or formatter is configured yet. If you add one, update this section.
@@ -38,22 +45,26 @@ The system is a from-scratch RAG agent — **no LangChain, no LlamaIndex**. Keep
 
 Data flow: `ingest.py` pulls a GitHub repo via PyGithub, embeds chunks with Ollama (`nomic-embed-text`), and persists them to ChromaDB at `./chroma_db`. At query time, `app.py` (Streamlit) calls into `agent.py`, which runs an Anthropic tool-use loop against the Claude API. The agent reaches the index through tools defined in `tools.py` — the retrieval path is tool-call mediated, not a direct RAG pipeline, so prompts and tool schemas in `prompts.py` / `tools.py` are the primary surface for behavior changes.
 
-Module responsibilities (per README):
-- `ingest.py` — repo fetch + chunk + embed + write to Chroma. Runs standalone.
-- `agent.py` — Anthropic SDK conversation loop (`claude-opus-4-7`) with tool dispatch; exposes `run_agent(user_query, collection_name)`.
-- `tools.py` — tool definitions (schemas + implementations) the agent invokes; this is where vector search, file reads, etc. live. `TOOL_SCHEMAS` is in Claude's format (`{name, description, input_schema}`), not OpenAI's.
+Module responsibilities:
+- `ingest.py` — repo fetch + chunk + embed + write to Chroma. Exposes `fetch_and_chunk_repo` and `embed_and_store_chunks` for Inngest steps. Also runs standalone as a CLI.
+- `agent.py` — Anthropic SDK conversation loop (`claude-opus-4-7`) with tool dispatch; exposes `run_agent(user_query, collection_name)`. Fires `repomind/agent_completed` to Inngest Dev Server after every run (daemon thread, non-blocking).
+- `tools.py` — tool definitions (schemas + implementations). `TOOL_SCHEMAS` is in Claude's format (`{name, description, input_schema}`). Tracks Ollama embed and ChromaDB query latencies via `_TOOL_METRICS` ContextVar.
 - `prompts.py` — `SYSTEM_PROMPT` and `QUERY_REWRITE_PROMPT` (the latter has a `{query}` placeholder for `.format()`).
 - `logger.py` — structured JSONL logging to `agent_logs.jsonl` (gitignored).
-- `app.py` — Streamlit front end wrapping the agent.
-- `deploy/vllm_modal.py` — **vestigial.** Kept for reference only; the project no longer uses vLLM or any OpenAI-compatible endpoint.
+- `inngest_setup.py` — shared Inngest client singleton (imported by `server.py` and `agent.py`).
+- `server.py` — FastAPI + Inngest server. Hosts three Inngest functions: `repomind/ingest_repo` (2 steps), `repomind/run_agent` (1 step), `repomind/agent_completed` (post-run metrics). REST: `POST /api/ingest`, `POST /api/query`, `GET /api/result/{session_id}`.
+- `app.py` — Streamlit front end. Ingestion triggers `POST /api/ingest` on the server (Inngest background job). Chat runs agent synchronously for immediate UX.
+- `deploy/vllm_modal.py` — **vestigial.** Kept for reference only.
 - `eval/` — offline evaluation harness: `test_queries.py` (benchmark set), `metrics.py` (scoring), `compare.py` (run/config comparison). Writes `eval_results.jsonl` / `benchmark_results.json` (both gitignored).
 
 ## Model and dependencies
 
-- LLM: **Claude API** (`claude-opus-4-7`) via the official `anthropic` Python SDK. Requires `ANTHROPIC_API_KEY` in `.env`. Opus 4.7 accepts only adaptive thinking (`thinking={"type": "adaptive"}`); `budget_tokens`, `temperature`, `top_p`, and `top_k` all return 400. `TOOL_SCHEMAS` must be in Claude's format.
+- LLM: **OpenAI-compatible API** via the `openai` Python SDK pointed at `VLLM_BASE_URL`. Matches rag-learning's pattern. Default model: `Qwen/Qwen2.5-7B-Instruct`. Works with any vLLM-served model that supports OpenAI function-calling (tool use). Set `VLLM_BASE_URL=None` to fall back to the real OpenAI API. `TOOL_SCHEMAS` are in OpenAI format (`{type: "function", function: {name, parameters}}`).
 - Embeddings: Ollama `nomic-embed-text`, accessed via the `ollama` Python client — embeddings are local, so the Ollama daemon must be running during ingest and query.
 - Vector store: ChromaDB persistent client rooted at `./chroma_db` (gitignored). Treat the directory as disposable; rebuild via `python ingest.py`.
 
 ## Secrets and generated files
 
 `.env`, `chroma_db/`, `agent_logs.jsonl`, `eval_results.jsonl`, and `benchmark_results.json` are gitignored. Never commit them.
+
+The `ANTHROPIC_API_KEY` is no longer used — repomind now uses `VLLM_API_KEY` + `VLLM_BASE_URL` (OpenAI-compatible).

@@ -10,11 +10,11 @@ Run with:
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
+import os
 from pathlib import Path
 
 import chromadb
+import httpx
 import pandas as pd
 import streamlit as st
 
@@ -42,17 +42,25 @@ with st.sidebar:
         if "/" not in repo_input:
             st.error("Format: owner/repo")
         else:
-            with st.spinner(f"Ingesting {repo_input} ({mode})..."):
-                result = subprocess.run(
-                    [sys.executable, "ingest.py", repo_input, mode],
-                    capture_output=True,
-                    text=True,
+            server_url = os.getenv("REPOMIND_SERVER_URL", "http://localhost:8000")
+            try:
+                r = httpx.post(
+                    f"{server_url}/api/ingest",
+                    json={"repo": repo_input, "mode": mode},
+                    timeout=5.0,
                 )
-                if result.returncode == 0:
-                    st.success("Ingested!")
-                    st.code(result.stdout[-500:])
-                else:
-                    st.error(result.stderr[-500:])
+                r.raise_for_status()
+                st.success(
+                    f"Ingest triggered for **{repo_input}** ({mode}). "
+                    f"Monitor progress in Inngest Dev UI → [localhost:8288](http://localhost:8288)"
+                )
+            except httpx.ConnectError:
+                st.error(
+                    "Cannot reach repomind server. Start it first:\n\n"
+                    "`uvicorn server:app --reload --port 8000`"
+                )
+            except httpx.HTTPStatusError as e:
+                st.error(f"Server error: {e.response.text}")
 
     st.divider()
 

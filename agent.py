@@ -1,50 +1,78 @@
-"""Core agent orchestrator — ReAct-style tool-use loop against Claude.
+"""Core agent orchestrator — ReAct-style tool-use loop with OpenAI-compatible LLM.
+
+Uses the OpenAI SDK with a configurable base_url so any vLLM-served model
+(Qwen, Llama, Mistral, …) works without code changes — matching rag-learning's
+pattern of pointing the OpenAI client at VLLM_BASE_URL.
 
 One agent, one loop. Given a user question and a Chroma collection name,
 rewrites the query for semantic search, then iterates:
 
-    LLM ──▶ tool_use? ──▶ run_tool ──▶ tool_result ──▶ LLM ...
+    LLM ──▶ tool_calls? ──▶ run_tool ──▶ tool result ──▶ LLM ...
 
-...until the model returns ``stop_reason == "end_turn"`` or we hit
-``max_steps``. Every LLM call, tool call, and tool result is logged to
-``agent_logs.jsonl`` via :func:`logger.log_step`.
+...until finish_reason == "stop" or ``max_steps`` is hit. Every LLM call,
+tool call, and tool result is logged to ``agent_logs.jsonl`` via log_step.
+A fire-and-forget event is sent to Inngest Dev Server after every run for
+dashboard visibility (repomind/agent_completed).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import threading
 import time
 import uuid
 from typing import Any
 
-import anthropic
+import httpx
 from dotenv import load_dotenv
+from openai import OpenAI
 
 from logger import log_step
 from prompts import QUERY_REWRITE_PROMPT, SYSTEM_PROMPT
-from tools import TOOL_SCHEMAS, run_tool
+from tools import TOOL_SCHEMAS, _TOOL_METRICS, run_tool
 
 load_dotenv()
 
-MODEL = "claude-opus-4-7"
-_client: anthropic.Anthropic | None = None
+MODEL = os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+_client: OpenAI | None = None
 
 
-def _get_client() -> anthropic.Anthropic:
-    """Lazy client init so imports don't fail when the key is absent."""
+def _get_client() -> OpenAI:
+    """Lazy client init — matches rag-learning's data_loader.py pattern."""
     global _client
     if _client is None:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is not set. Add it to .env.")
-        _client = anthropic.Anthropic(api_key=api_key)
+        _client = OpenAI(
+            api_key=os.getenv("VLLM_API_KEY", "no-key"),
+            base_url=os.getenv("VLLM_BASE_URL"),  # None → default OpenAI endpoint
+        )
     return _client
+
+
+def _fire_monitoring_event(data: dict) -> None:
+    """Send repomind/agent_completed to Inngest Dev Server in a daemon thread.
+
+    Daemon thread ensures it never stalls the Streamlit response.
+    Swallows all errors so monitoring never breaks the agent.
+    """
+    def _send() -> None:
+        try:
+            url = os.getenv("INNGEST_DEV_EVENT_URL", "http://localhost:8288/e/repomind-dev")
+            httpx.post(
+                url,
+                json=[{"name": "repomind/agent_completed", "data": data}],
+                timeout=2.0,
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def query_rewrite(user_query: str) -> str:
     """Rewrite a user question into a compact semantic-search query."""
-    response = _get_client().messages.create(
+    response = _get_client().chat.completions.create(
         model=MODEL,
         max_tokens=200,
         messages=[{
@@ -52,11 +80,7 @@ def query_rewrite(user_query: str) -> str:
             "content": QUERY_REWRITE_PROMPT.format(query=user_query),
         }],
     )
-    return "".join(b.text for b in response.content if b.type == "text").strip()
-
-
-def _extract_text(blocks: list[Any]) -> str:
-    return "".join(b.text for b in blocks if getattr(b, "type", None) == "text")
+    return (response.choices[0].message.content or "").strip()
 
 
 def run_agent(
@@ -66,7 +90,8 @@ def run_agent(
 ) -> dict[str, Any]:
     """Drive the agent loop until the model finishes or ``max_steps`` is hit."""
     client = _get_client()
-    session_id = str(uuid.uuid4())[:8]
+    session_id = str(uuid.uuid4())
+    run_start = time.time()
 
     rewritten = query_rewrite(user_query)
     log_step(session_id, 0, "query_rewrite", {
@@ -74,103 +99,146 @@ def run_agent(
         "rewritten": rewritten,
     })
 
-    messages: list[dict[str, Any]] = [{
-        "role": "user",
-        "content": (
-            f"Original question: {user_query}\n"
-            f"Optimized search query: {rewritten}"
-        ),
-    }]
+    # System prompt as first message (OpenAI convention)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Original question: {user_query}\n"
+                f"Optimized search query: {rewritten}"
+            ),
+        },
+    ]
 
     for step in range(1, max_steps + 1):
         t0 = time.time()
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL,
             max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            tools=TOOL_SCHEMAS,
             messages=messages,
+            tools=TOOL_SCHEMAS,
+            tool_choice="auto",
         )
         llm_latency = round(time.time() - t0, 2)
 
-        if response.stop_reason == "end_turn":
-            answer = _extract_text(response.content)
+        choice = response.choices[0]
+        message = choice.message
+        finish_reason = choice.finish_reason
+        input_tok = response.usage.prompt_tokens if response.usage else 0
+        output_tok = response.usage.completion_tokens if response.usage else 0
+
+        if finish_reason == "stop":
+            answer = message.content or ""
+            total_latency = round(time.time() - run_start, 2)
             log_step(session_id, step, "final_answer", {
                 "answer": answer,
                 "llm_latency_s": llm_latency,
+                "total_latency_s": total_latency,
                 "total_steps": step,
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
+                "input_tokens": input_tok,
+                "output_tokens": output_tok,
             })
-            return {
+            result = {
                 "session_id": session_id,
                 "answer": answer,
                 "steps": step,
                 "messages": messages,
-                "usage": {
-                    "input_tokens": response.usage.input_tokens,
-                    "output_tokens": response.usage.output_tokens,
-                },
+                "usage": {"input_tokens": input_tok, "output_tokens": output_tok},
             }
-
-        if response.stop_reason == "refusal":
-            log_step(session_id, step, "refusal", {"llm_latency_s": llm_latency})
-            return {
+            _fire_monitoring_event({
                 "session_id": session_id,
-                "answer": "The model declined to answer for safety reasons.",
+                "query": user_query[:200],
                 "steps": step,
-                "messages": messages,
-            }
+                "stop_reason": "stop",
+                "input_tokens": input_tok,
+                "output_tokens": output_tok,
+                "total_latency_s": total_latency,
+            })
+            return result
 
-        tool_uses = [b for b in response.content if b.type == "tool_use"]
-
-        if not tool_uses:
-            # max_tokens, pause_turn, stop_sequence, or anything else —
-            # no tool to run and no end_turn, so surface what we have.
-            answer = _extract_text(response.content)
+        if finish_reason != "tool_calls" or not message.tool_calls:
+            # length, content_filter, or stop without tool calls
+            answer = message.content or ""
+            total_latency = round(time.time() - run_start, 2)
             log_step(session_id, step, "unexpected_stop", {
-                "stop_reason": response.stop_reason,
+                "stop_reason": finish_reason,
                 "llm_latency_s": llm_latency,
+            })
+            _fire_monitoring_event({
+                "session_id": session_id,
+                "query": user_query[:200],
+                "steps": step,
+                "stop_reason": finish_reason,
+                "total_latency_s": total_latency,
             })
             return {
                 "session_id": session_id,
-                "answer": answer or f"[stopped: {response.stop_reason}]",
+                "answer": answer or f"[stopped: {finish_reason}]",
                 "steps": step,
                 "messages": messages,
             }
 
-        messages.append({"role": "assistant", "content": response.content})
+        # Append assistant message preserving full tool_calls structure
+        messages.append({
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in message.tool_calls
+            ],
+        })
 
-        tool_results: list[dict[str, Any]] = []
-        for tool_use in tool_uses:
-            args = dict(tool_use.input)
+        for tc in message.tool_calls:
+            tool_name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                args = {}
+
             log_step(session_id, step, "tool_call", {
-                "tool": tool_use.name,
+                "tool": tool_name,
                 "args": args,
                 "llm_latency_s": llm_latency,
             })
 
+            _TOOL_METRICS.set({})
             t1 = time.time()
-            result = run_tool(tool_use.name, args, collection_name)
+            result = run_tool(tool_name, args, collection_name)
             tool_latency = round(time.time() - t1, 2)
+            tool_metrics = _TOOL_METRICS.get({})
 
             result_str = str(result)
             log_step(session_id, step, "tool_result", {
-                "tool": tool_use.name,
+                "tool": tool_name,
                 "result_preview": result_str[:200],
                 "result_chars": len(result_str),
                 "tool_latency_s": tool_latency,
+                **tool_metrics,
             })
 
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tool_use.id,
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
                 "content": result_str,
             })
 
-        messages.append({"role": "user", "content": tool_results})
-
+    total_latency = round(time.time() - run_start, 2)
     log_step(session_id, max_steps, "max_steps_reached", {})
+    _fire_monitoring_event({
+        "session_id": session_id,
+        "query": user_query[:200],
+        "steps": max_steps,
+        "stop_reason": "max_steps_reached",
+        "total_latency_s": total_latency,
+    })
     return {
         "session_id": session_id,
         "answer": "I couldn't find a complete answer after max steps.",

@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+from contextvars import ContextVar
 from itertools import islice
 
 import chromadb
@@ -26,6 +28,11 @@ CHROMA_PATH = "./chroma_db"
 EMBED_MODEL = "nomic-embed-text"
 MAX_FILE_CHARS = 3000
 VALID_FILTER_TYPES = {"function", "class", "doc", "code"}
+
+# Per-call latency metrics stored in a ContextVar so concurrent calls (async
+# server + Streamlit thread) never race on a shared module-level dict.
+# agent.py reads this after run_tool() returns and merges it into the log entry.
+_TOOL_METRICS: ContextVar[dict] = ContextVar("_TOOL_METRICS", default={})
 
 
 def _parse_owner_repo(collection_name: str) -> tuple[str, str]:
@@ -49,7 +56,10 @@ def _get_repo(collection_name: str):
 
 
 def _embed(text: str) -> list[float]:
-    return ollama.embeddings(model=EMBED_MODEL, prompt=text)["embedding"]
+    t0 = time.time()
+    result = ollama.embeddings(model=EMBED_MODEL, prompt=text)["embedding"]
+    _TOOL_METRICS.set({**_TOOL_METRICS.get({}), "embed_ms": round((time.time() - t0) * 1000)})
+    return result
 
 
 def vector_search(
@@ -71,15 +81,19 @@ def vector_search(
     except Exception as e:
         return f"Error: collection {collection_name!r} not found ({e})."
 
+    query_vec = _embed(query)
+
     kwargs: dict = {
-        "query_embeddings": [_embed(query)],
+        "query_embeddings": [query_vec],
         "n_results": n_results,
         "include": ["documents", "metadatas", "distances"],
     }
     if filter_type:
         kwargs["where"] = {"type": filter_type}
 
+    t1 = time.time()
     results = collection.query(**kwargs)
+    _TOOL_METRICS.set({**_TOOL_METRICS.get({}), "chroma_ms": round((time.time() - t1) * 1000)})
     ids = results.get("ids", [[]])[0]
     docs = results.get("documents", [[]])[0]
     metas = results.get("metadatas", [[]])[0]
@@ -170,59 +184,68 @@ def get_recent_commits(collection_name: str, n: int = 5) -> str:
 
 TOOL_SCHEMAS = [
     {
-        "name": "vector_search",
-        "description": (
-            "Search the indexed codebase semantically. Use this FIRST "
-            "for any question about code or docs."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query — use technical keywords",
+        "type": "function",
+        "function": {
+            "name": "vector_search",
+            "description": (
+                "Search the indexed codebase semantically. Use this FIRST "
+                "for any question about code or docs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query — use technical keywords",
+                    },
+                    "filter_type": {
+                        "type": "string",
+                        "enum": ["function", "class", "doc", "code"],
+                        "description": "Optional: filter to a specific chunk type",
+                    },
+                    "n_results": {
+                        "type": "integer",
+                        "description": "Number of results",
+                        "default": 5,
+                    },
                 },
-                "filter_type": {
-                    "type": "string",
-                    "enum": ["function", "class", "doc", "code"],
-                    "description": "Optional: filter to a specific chunk type",
-                },
-                "n_results": {
-                    "type": "integer",
-                    "description": "Number of results",
-                    "default": 5,
-                },
+                "required": ["query"],
             },
-            "required": ["query"],
         },
     },
     {
-        "name": "get_file",
-        "description": "Fetch the full contents of a specific file from the repo.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the file, e.g. 'src/auth/service.py'",
+        "type": "function",
+        "function": {
+            "name": "get_file",
+            "description": "Fetch the full contents of a specific file from the repo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file, e.g. 'src/auth/service.py'",
+                    },
                 },
+                "required": ["file_path"],
             },
-            "required": ["file_path"],
         },
     },
     {
-        "name": "get_recent_commits",
-        "description": "Get the last N commits from the repo.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "n": {
-                    "type": "integer",
-                    "description": "Number of commits",
-                    "default": 5,
+        "type": "function",
+        "function": {
+            "name": "get_recent_commits",
+            "description": "Get the last N commits from the repo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "n": {
+                        "type": "integer",
+                        "description": "Number of commits",
+                        "default": 5,
+                    },
                 },
+                "required": [],
             },
-            "required": [],
         },
     },
 ]

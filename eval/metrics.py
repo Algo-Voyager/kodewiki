@@ -2,7 +2,7 @@
 
 Reads the structured JSONL log emitted by ``logger.log_step`` and produces
 per-session and aggregate statistics (latency, step/tool counts, token
-usage, and estimated Claude API spend).
+usage, and estimated LLM spend).
 
 Usage:
     python eval/metrics.py            # prints aggregate metrics as JSON
@@ -11,15 +11,16 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from statistics import mean, median
 
 LOG_FILE = Path("agent_logs.jsonl")
 
-# claude-opus-4-7 pricing — USD per 1M tokens.
-# Source: claude-api skill models table, cached 2026-04-15.
-INPUT_PRICE_PER_M = 5.0
-OUTPUT_PRICE_PER_M = 25.0
+# LLM pricing — USD per 1M tokens. Defaults to 0 for local/self-hosted models.
+# Override via LLM_INPUT_PRICE_PER_M / LLM_OUTPUT_PRICE_PER_M env vars.
+INPUT_PRICE_PER_M = float(os.getenv("LLM_INPUT_PRICE_PER_M", "0.0"))
+OUTPUT_PRICE_PER_M = float(os.getenv("LLM_OUTPUT_PRICE_PER_M", "0.0"))
 
 
 def _estimate_cost_usd(input_tokens: int, output_tokens: int) -> float:
