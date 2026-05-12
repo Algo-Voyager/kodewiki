@@ -14,8 +14,8 @@ Setup assumes a local venv and a running Ollama daemon with `nomic-embed-text` p
 # One-time
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-ollama pull nomic-embed-text
-cp .env.example .env   # fill in ANTHROPIC_API_KEY, GITHUB_TOKEN
+cp .env.example .env   # fill in VLLM_API_KEY, VLLM_BASE_URL, EMBED_BASE_URL, GITHUB_TOKEN
+# Deploy both models to Modal first: .venv/bin/modal deploy deploy/qwen_modal.py
 
 # Terminal 1 — FastAPI + Inngest backend (required for Streamlit ingestion)
 uvicorn server:app --reload --port 8000
@@ -59,9 +59,9 @@ Module responsibilities:
 
 ## Model and dependencies
 
-- LLM: **OpenAI-compatible API** via the `openai` Python SDK pointed at `VLLM_BASE_URL`. Matches rag-learning's pattern. Default model: `Qwen/Qwen2.5-7B-Instruct`. Works with any vLLM-served model that supports OpenAI function-calling (tool use). Set `VLLM_BASE_URL=None` to fall back to the real OpenAI API. `TOOL_SCHEMAS` are in OpenAI format (`{type: "function", function: {name, parameters}}`).
-- Embeddings: Ollama `nomic-embed-text`, accessed via the `ollama` Python client — embeddings are local, so the Ollama daemon must be running during ingest and query.
-- Vector store: ChromaDB persistent client rooted at `./chroma_db` (gitignored). Treat the directory as disposable; rebuild via `python ingest.py`.
+- LLM: **OpenAI-compatible API** via the `openai` Python SDK pointed at `VLLM_BASE_URL`. Default model: `Qwen/Qwen2.5-7B-Instruct` served by vLLM on Modal. `TOOL_SCHEMAS` are in OpenAI format (`{type: "function", function: {name, parameters}}`).
+- Embeddings: `BAAI/bge-small-en-v1.5` via `sentence-transformers` on Modal, exposed as an OpenAI-compatible `/v1/embeddings` endpoint at `EMBED_BASE_URL`. Called via the `openai` Python SDK. Both models are deployed together in `deploy/qwen_modal.py` under the `repomind-vllm` Modal app.
+- Vector store: ChromaDB persistent client rooted at `./chroma_db` (gitignored). Treat the directory as disposable; rebuild via `python ingest.py`. Note: switching embedding models requires re-ingesting all collections (vector dimensions change).
 
 ## Secrets and generated files
 

@@ -6,9 +6,9 @@ A developer documentation agent: point it at a GitHub repo, and ask questions ab
 
 | Layer | Technology |
 |-------|-----------|
-| **LLM** | Any OpenAI-compatible model via [vLLM](https://github.com/vllm-project/vllm) — default `Qwen/Qwen2.5-7B-Instruct` |
-| **LLM client** | `openai` Python SDK with custom `base_url` (same pattern as rag-learning) |
-| **Embeddings** | `nomic-embed-text` running locally via [Ollama](https://ollama.com) — never leaves the machine |
+| **LLM** | `Qwen/Qwen2.5-7B-Instruct` via [vLLM](https://github.com/vllm-project/vllm) on Modal — OpenAI-compatible |
+| **LLM client** | `openai` Python SDK with custom `base_url` |
+| **Embeddings** | `BAAI/bge-small-en-v1.5` via `sentence-transformers` on Modal — OpenAI-compatible |
 | **Vector DB** | ChromaDB (persistent, stored in `./chroma_db`) |
 | **GitHub API** | PyGithub |
 | **UI** | Streamlit |
@@ -37,36 +37,34 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 4. Install and start Ollama, then pull the embedding model
+### 4. Deploy both models to Modal
 
-Install Ollama from https://ollama.com, then:
-
-```bash
-ollama pull nomic-embed-text
-ollama serve   # usually starts automatically after install
-```
-
-The Ollama daemon must be running during both ingest and query — embeddings are computed locally.
-
-### 5. Start a vLLM server
-
-Repomind talks to any OpenAI-compatible endpoint. Start a local vLLM server (or point at any hosted OpenAI-compatible API):
+Both the LLM and embedding model run on Modal — nothing runs locally.
 
 ```bash
-vllm serve Qwen/Qwen2.5-7B-Instruct --port 8001
-```
+# One-time: install Modal and authenticate
+pip install modal
+modal token new
 
-Or deploy to Modal (stays up, scales to zero when idle):
+# Create secrets
+modal secret create huggingface-secret HF_TOKEN=hf_xxx   # leave empty if not needed
+modal secret create vllm-api-key VLLM_API_KEY=<long-random-string>
 
-```bash
+# Deploy — prints two public URLs
 .venv/bin/modal deploy deploy/qwen_modal.py
-# → sets VLLM_BASE_URL to the printed URL in .env
+```
 
-# To stop and clean up all Modal resources:
+Modal prints two URLs:
+- **LLM**: `https://<workspace>--repomind-vllm-serve.modal.run`
+- **Embeddings**: `https://<workspace>--repomind-vllm-embedding-api.modal.run`
+
+To stop and clean up all Modal resources:
+
+```bash
 bash cleanup_modal.sh
 ```
 
-### 6. Configure environment variables
+### 5. Configure environment variables
 
 ```bash
 cp .env.example .env
@@ -76,12 +74,14 @@ Edit `.env` and fill in:
 
 | Variable | Description |
 |----------|-------------|
-| `VLLM_API_KEY` | API key for your vLLM server (can be any string for local servers) |
-| `VLLM_BASE_URL` | Base URL of the vLLM OpenAI-compatible endpoint, e.g. `http://localhost:8001/v1` |
-| `VLLM_MODEL` | Model name to use, e.g. `Qwen/Qwen2.5-7B-Instruct` |
+| `VLLM_API_KEY` | API key set in the `vllm-api-key` Modal secret |
+| `VLLM_BASE_URL` | LLM endpoint URL from Modal deploy + `/v1` |
+| `VLLM_MODEL` | `Qwen/Qwen2.5-7B-Instruct` |
+| `EMBED_BASE_URL` | Embedding endpoint URL from Modal deploy |
+| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` |
 | `GITHUB_TOKEN` | GitHub personal access token with repo read access |
 
-### 7. Start the FastAPI + Inngest backend
+### 6. Start the FastAPI + Inngest backend
 
 The backend handles background ingestion jobs and agent run monitoring.
 
@@ -90,7 +90,7 @@ The backend handles background ingestion jobs and agent run monitoring.
 uvicorn server:app --reload --port 8000
 ```
 
-### 8. Start the Inngest Dev Server
+### 7. Start the Inngest Dev Server
 
 ```bash
 # Terminal 2 — Inngest Dev Server (UI at http://localhost:8288)
@@ -99,7 +99,7 @@ npx inngest-cli@latest dev -u http://localhost:8000/api/inngest
 
 Open http://localhost:8288 to monitor ingest jobs and agent runs step-by-step.
 
-### 9. Launch the Streamlit UI
+### 8. Launch the Streamlit UI
 
 ```bash
 # Terminal 3

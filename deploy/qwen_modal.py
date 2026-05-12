@@ -1,8 +1,9 @@
-"""Deploy Qwen2.5-7B-Instruct via vLLM on Modal — OpenAI-compatible endpoint.
+"""Deploy two services under the "repomind-vllm" Modal app:
 
-Unlike rag-learning (which uses transformers directly), repomind needs a full
-OpenAI-compatible /v1/chat/completions endpoint because agent.py uses the
-openai SDK with VLLM_BASE_URL. vLLM's built-in server provides exactly that.
+  1. serve         — Qwen2.5-7B-Instruct LLM via vLLM  (GPU: A10G)
+                     OpenAI-compatible /v1/chat/completions
+  2. embedding_api — BAAI/bge-small-en-v1.5 embeddings (CPU)
+                     OpenAI-compatible /v1/embeddings
 
 ─── One-time setup ───────────────────────────────────────────────────────────
     # 1. Install Modal and authenticate
@@ -12,7 +13,7 @@ openai SDK with VLLM_BASE_URL. vLLM's built-in server provides exactly that.
     # 2. Hugging Face token (required for gated models; fine to leave empty for Qwen)
     .venv/bin/modal secret create huggingface-secret HF_TOKEN=hf_xxx
 
-    # 3. API key to protect the endpoint
+    # 3. API key to protect both endpoints
     .venv/bin/modal secret create vllm-api-key VLLM_API_KEY=choose-a-long-random-string
 
 ─── Deploy ───────────────────────────────────────────────────────────────────
@@ -22,23 +23,35 @@ openai SDK with VLLM_BASE_URL. vLLM's built-in server provides exactly that.
     # Persistent — stays up, scales to zero when idle
     .venv/bin/modal deploy deploy/qwen_modal.py
 
-    Modal prints a public URL, e.g.:
-      https://<workspace>--repomind-vllm-serve.modal.run
+    Modal prints two public URLs, e.g.:
+      LLM        : https://<workspace>--repomind-vllm-serve.modal.run
+      Embeddings : https://<workspace>--repomind-vllm-embedding-api.modal.run
 
     Set in .env:
       VLLM_BASE_URL=https://<workspace>--repomind-vllm-serve.modal.run/v1
+      EMBED_BASE_URL=https://<workspace>--repomind-vllm-embedding-api.modal.run
       VLLM_API_KEY=<your key>
       VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct
+      EMBED_MODEL=BAAI/bge-small-en-v1.5
 
-─── Test (OpenAI-compatible) ─────────────────────────────────────────────────
+─── Test LLM ─────────────────────────────────────────────────────────────────
     BASE=https://<workspace>--repomind-vllm-serve.modal.run
     KEY=$VLLM_API_KEY
 
-    curl $BASE/v1/chat/completions \\
-        -H "Authorization: Bearer $KEY" \\
-        -H "Content-Type: application/json" \\
+    curl $BASE/v1/chat/completions \
+        -H "Authorization: Bearer $KEY" \
+        -H "Content-Type: application/json" \
         -d '{"model": "Qwen/Qwen2.5-7B-Instruct",
              "messages": [{"role": "user", "content": "What is a ReAct agent?"}]}'
+
+─── Test embeddings ──────────────────────────────────────────────────────────
+    EMBED=https://<workspace>--repomind-vllm-embedding-api.modal.run
+    KEY=$VLLM_API_KEY
+
+    curl $EMBED/v1/embeddings \
+        -H "Authorization: Bearer $KEY" \
+        -H "Content-Type: application/json" \
+        -d '{"input": ["Hello world"], "model": "BAAI/bge-small-en-v1.5"}'
 
 ─── Stop ─────────────────────────────────────────────────────────────────────
     .venv/bin/modal app stop repomind-vllm
@@ -49,18 +62,29 @@ openai SDK with VLLM_BASE_URL. vLLM's built-in server provides exactly that.
 
 import modal
 
-# ── Model + hardware ──────────────────────────────────────────────────────────
-MODEL_NAME     = "Qwen/Qwen2.5-7B-Instruct"   # open model, no HF gating required
+try:
+    from fastapi import FastAPI, HTTPException, Request
+except ImportError:
+    FastAPI = object
+    Request = object
+    HTTPException = Exception
+
+# ── LLM config ────────────────────────────────────────────────────────────────
+MODEL_NAME     = "Qwen/Qwen2.5-7B-Instruct"
 MODEL_REVISION = "main"
-MAX_MODEL_LEN  = 8192                          # context window
+MAX_MODEL_LEN  = 8192
 VLLM_VERSION   = "0.6.4.post1"
 
-GPU_TYPE = "A10G"   # "A10G" (24 GB) | "L4" (24 GB) | "A100-40GB" | "H100"
+GPU_TYPE = "A10G"
 N_GPU    = 1
+
+# ── Embedding model config ────────────────────────────────────────────────────
+EMBED_MODEL_ID  = "BAAI/bge-small-en-v1.5"
+EMBED_MODEL_DIR = "/embed-cache"
 
 MINUTES = 60
 
-# ── Container image ───────────────────────────────────────────────────────────
+# ── Container images ──────────────────────────────────────────────────────────
 vllm_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
@@ -70,14 +94,25 @@ vllm_image = (
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
 
+embed_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install(
+        "sentence-transformers>=3.0.0",
+        "torch>=2.2.0",
+        "fastapi[standard]",
+    )
+)
+
 # ── Volumes — weights cached so restarts are fast ─────────────────────────────
-hf_cache   = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
-vllm_cache = modal.Volume.from_name("vllm-cache",        create_if_missing=True)
+hf_cache    = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
+vllm_cache  = modal.Volume.from_name("vllm-cache",        create_if_missing=True)
+embed_cache = modal.Volume.from_name("embed-cache",        create_if_missing=True)
 
 # ── Modal app ─────────────────────────────────────────────────────────────────
 app = modal.App("repomind-vllm")
 
 
+# ── 1. LLM service (vLLM, OpenAI-compatible /v1/chat/completions) ─────────────
 @app.function(
     image=vllm_image,
     gpu=GPU_TYPE if N_GPU == 1 else f"{GPU_TYPE}:{N_GPU}",
@@ -92,15 +127,9 @@ app = modal.App("repomind-vllm")
         modal.Secret.from_name("vllm-api-key"),
     ],
 )
-@modal.concurrent(max_inputs=32)
-@modal.web_server(port=8000, startup_timeout=10 * MINUTES)
+@modal.web_server(port=8000, startup_timeout=20 * MINUTES)
 def serve() -> None:
-    """Launch vLLM's OpenAI-compatible server on port 8000.
-
-    Modal proxies the port to the public URL printed after deploy.
-    The /v1/chat/completions endpoint is used directly by agent.py via
-    openai.OpenAI(base_url=VLLM_BASE_URL).
-    """
+    """Launch vLLM's OpenAI-compatible server on port 8000."""
     import os
     import subprocess
 
@@ -120,3 +149,49 @@ def serve() -> None:
         cmd += ["--api-key", api_key]
 
     subprocess.Popen(cmd)
+
+
+# ── 2. Embedding service (sentence-transformers, OpenAI-compatible /v1/embeddings)
+@app.function(
+    image=embed_image,
+    volumes={EMBED_MODEL_DIR: embed_cache},
+    secrets=[modal.Secret.from_name("vllm-api-key")],
+    scaledown_window=15 * MINUTES,
+    timeout=120,
+)
+@modal.asgi_app()
+def embedding_api():
+    import os
+    from sentence_transformers import SentenceTransformer
+
+    print(f"[startup] Loading embedding model: {EMBED_MODEL_ID}")
+    model = SentenceTransformer(EMBED_MODEL_ID, cache_folder=EMBED_MODEL_DIR)
+    embed_cache.commit()
+    print("[startup] Embedding model ready ✓")
+
+    web = FastAPI()
+
+    @web.post("/v1/embeddings")
+    async def create_embeddings(request: Request):
+        auth = request.headers.get("Authorization", "")
+        api_key = os.environ.get("VLLM_API_KEY", "")
+        if api_key and auth != f"Bearer {api_key}":
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        body  = await request.json()
+        texts = body.get("input", [])
+        if isinstance(texts, str):
+            texts = [texts]
+
+        vecs = model.encode(texts, normalize_embeddings=True).tolist()
+        return {
+            "object": "list",
+            "data": [
+                {"object": "embedding", "embedding": v, "index": i}
+                for i, v in enumerate(vecs)
+            ],
+            "model": EMBED_MODEL_ID,
+            "usage": {"prompt_tokens": 0, "total_tokens": 0},
+        }
+
+    return web

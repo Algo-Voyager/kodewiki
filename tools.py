@@ -18,14 +18,19 @@ from contextvars import ContextVar
 from itertools import islice
 
 import chromadb
-import ollama
+import openai
 from dotenv import load_dotenv
 from github import Auth, Github
 
 load_dotenv()
 
 CHROMA_PATH = "./chroma_db"
-EMBED_MODEL = "nomic-embed-text"
+EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+
+_embed_client = openai.OpenAI(
+    base_url=os.getenv("EMBED_BASE_URL"),
+    api_key=os.getenv("VLLM_API_KEY", ""),
+)
 MAX_FILE_CHARS = 3000
 VALID_FILTER_TYPES = {"function", "class", "doc", "code"}
 
@@ -57,9 +62,9 @@ def _get_repo(collection_name: str):
 
 def _embed(text: str) -> list[float]:
     t0 = time.time()
-    result = ollama.embeddings(model=EMBED_MODEL, prompt=text)["embedding"]
+    resp = _embed_client.embeddings.create(input=[text], model=EMBED_MODEL)
     _TOOL_METRICS.set({**_TOOL_METRICS.get({}), "embed_ms": round((time.time() - t0) * 1000)})
-    return result
+    return resp.data[0].embedding
 
 
 def vector_search(

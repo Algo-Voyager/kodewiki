@@ -1,24 +1,18 @@
-"""Core agent orchestrator — ReAct-style tool-use loop with OpenAI-compatible LLM.
+"""Core agent orchestrator — text-based ReAct loop using rag-learning's generate endpoint.
 
-Uses the OpenAI SDK with a configurable base_url so any vLLM-served model
-(Qwen, Llama, Mistral, …) works without code changes — matching rag-learning's
-pattern of pointing the OpenAI client at VLLM_BASE_URL.
+Uses httpx to POST to QWEN_GENERATE_URL (rag-learning's QwenService) and drives a
+Thought → Action → Observation loop until the model outputs "Final Answer:" or
+max_steps is hit.
 
-One agent, one loop. Given a user question and a Chroma collection name,
-rewrites the query for semantic search, then iterates:
-
-    LLM ──▶ tool_calls? ──▶ run_tool ──▶ tool result ──▶ LLM ...
-
-...until finish_reason == "stop" or ``max_steps`` is hit. Every LLM call,
-tool call, and tool result is logged to ``agent_logs.jsonl`` via log_step.
-A fire-and-forget event is sent to Inngest Dev Server after every run for
-dashboard visibility (repomind/agent_completed).
+    LLM ──▶ parse Action ──▶ run_tool ──▶ Observation ──▶ LLM ...
+                              ──▶ Final Answer ──▶ return
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -27,35 +21,32 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from openai import OpenAI
 
 from logger import log_step
-from prompts import QUERY_REWRITE_PROMPT, SYSTEM_PROMPT
-from tools import TOOL_SCHEMAS, _TOOL_METRICS, run_tool
+from prompts import QUERY_REWRITE_PROMPT, REACT_PROMPT_TEMPLATE
+from tools import _TOOL_METRICS, run_tool
 
 load_dotenv()
 
-MODEL = os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-_client: OpenAI | None = None
+QWEN_GENERATE_URL = os.getenv("QWEN_GENERATE_URL", "")
+VLLM_API_KEY = os.getenv("VLLM_API_KEY", "")
 
 
-def _get_client() -> OpenAI:
-    """Lazy client init — matches rag-learning's data_loader.py pattern."""
-    global _client
-    if _client is None:
-        _client = OpenAI(
-            api_key=os.getenv("VLLM_API_KEY", "no-key"),
-            base_url=os.getenv("VLLM_BASE_URL"),  # None → default OpenAI endpoint
-        )
-    return _client
+def _generate(prompt: str, max_new_tokens: int = 512, temperature: float = 0.2) -> str:
+    resp = httpx.post(
+        QWEN_GENERATE_URL,
+        json={"prompt": prompt, "max_new_tokens": max_new_tokens, "temperature": temperature},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {VLLM_API_KEY}",
+        },
+        timeout=120.0,
+    )
+    resp.raise_for_status()
+    return resp.json()["response"].strip()
 
 
 def _fire_monitoring_event(data: dict) -> None:
-    """Send repomind/agent_completed to Inngest Dev Server in a daemon thread.
-
-    Daemon thread ensures it never stalls the Streamlit response.
-    Swallows all errors so monitoring never breaks the agent.
-    """
     def _send() -> None:
         try:
             url = os.getenv("INNGEST_DEV_EVENT_URL", "http://localhost:8288/e/repomind-dev")
@@ -72,15 +63,30 @@ def _fire_monitoring_event(data: dict) -> None:
 
 def query_rewrite(user_query: str) -> str:
     """Rewrite a user question into a compact semantic-search query."""
-    response = _get_client().chat.completions.create(
-        model=MODEL,
-        max_tokens=200,
-        messages=[{
-            "role": "user",
-            "content": QUERY_REWRITE_PROMPT.format(query=user_query),
-        }],
+    return _generate(
+        QUERY_REWRITE_PROMPT.format(query=user_query),
+        max_new_tokens=100,
+        temperature=0.1,
     )
-    return (response.choices[0].message.content or "").strip()
+
+
+def _parse_action(text: str) -> tuple[str, dict] | None:
+    """Extract (tool_name, args_dict) from a ReAct response, or None if not found."""
+    action_match = re.search(r"Action:\s*(\w+)", text)
+    if not action_match:
+        return None
+    tool_name = action_match.group(1).strip()
+
+    input_match = re.search(r"Action Input:\s*(\{.*?\})", text, re.DOTALL)
+    if input_match:
+        try:
+            args = json.loads(input_match.group(1))
+        except json.JSONDecodeError:
+            args = {}
+    else:
+        args = {}
+
+    return tool_name, args
 
 
 def run_agent(
@@ -88,8 +94,7 @@ def run_agent(
     collection_name: str,
     max_steps: int = 6,
 ) -> dict[str, Any]:
-    """Drive the agent loop until the model finishes or ``max_steps`` is hit."""
-    client = _get_client()
+    """Drive the ReAct loop until Final Answer or max_steps."""
     session_id = str(uuid.uuid4())
     run_start = time.time()
 
@@ -99,136 +104,95 @@ def run_agent(
         "rewritten": rewritten,
     })
 
-    # System prompt as first message (OpenAI convention)
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"Original question: {user_query}\n"
-                f"Optimized search query: {rewritten}"
-            ),
-        },
-    ]
+    scratchpad = ""
+    total_embed_ms: int = 0
+    total_chroma_ms: int = 0
 
     for step in range(1, max_steps + 1):
-        t0 = time.time()
-        response = client.chat.completions.create(
-            model=MODEL,
-            max_tokens=2000,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-            tool_choice="auto",
+        prompt = REACT_PROMPT_TEMPLATE.format(
+            question=user_query,
+            rewritten=rewritten,
+            scratchpad=scratchpad,
         )
+
+        t0 = time.time()
+        raw = _generate(prompt, max_new_tokens=1000, temperature=0.2)
         llm_latency = round(time.time() - t0, 2)
 
-        choice = response.choices[0]
-        message = choice.message
-        finish_reason = choice.finish_reason
-        input_tok = response.usage.prompt_tokens if response.usage else 0
-        output_tok = response.usage.completion_tokens if response.usage else 0
-
-        if finish_reason == "stop":
-            answer = message.content or ""
+        # Final answer check
+        if "Final Answer:" in raw:
+            answer = raw.split("Final Answer:", 1)[-1].strip()
             total_latency = round(time.time() - run_start, 2)
             log_step(session_id, step, "final_answer", {
                 "answer": answer,
                 "llm_latency_s": llm_latency,
                 "total_latency_s": total_latency,
                 "total_steps": step,
-                "input_tokens": input_tok,
-                "output_tokens": output_tok,
             })
-            result = {
-                "session_id": session_id,
-                "answer": answer,
-                "steps": step,
-                "messages": messages,
-                "usage": {"input_tokens": input_tok, "output_tokens": output_tok},
-            }
             _fire_monitoring_event({
                 "session_id": session_id,
                 "query": user_query[:200],
                 "steps": step,
                 "stop_reason": "stop",
-                "input_tokens": input_tok,
-                "output_tokens": output_tok,
                 "total_latency_s": total_latency,
+                "embed_ms": total_embed_ms or None,
+                "chroma_ms": total_chroma_ms or None,
             })
-            return result
+            return {
+                "session_id": session_id,
+                "answer": answer,
+                "steps": step,
+                "messages": [{"role": "assistant", "content": scratchpad + raw}],
+            }
 
-        if finish_reason != "tool_calls" or not message.tool_calls:
-            # length, content_filter, or stop without tool calls
-            answer = message.content or ""
+        # Parse tool call
+        parsed = _parse_action(raw)
+        if parsed is None:
+            # Model gave a plain response without Action or Final Answer
             total_latency = round(time.time() - run_start, 2)
-            log_step(session_id, step, "unexpected_stop", {
-                "stop_reason": finish_reason,
-                "llm_latency_s": llm_latency,
-            })
+            log_step(session_id, step, "unexpected_stop", {"llm_latency_s": llm_latency})
             _fire_monitoring_event({
                 "session_id": session_id,
                 "query": user_query[:200],
                 "steps": step,
-                "stop_reason": finish_reason,
+                "stop_reason": "no_action",
                 "total_latency_s": total_latency,
+                "embed_ms": total_embed_ms or None,
+                "chroma_ms": total_chroma_ms or None,
             })
             return {
                 "session_id": session_id,
-                "answer": answer or f"[stopped: {finish_reason}]",
+                "answer": raw,
                 "steps": step,
-                "messages": messages,
+                "messages": [{"role": "assistant", "content": scratchpad + raw}],
             }
 
-        # Append assistant message preserving full tool_calls structure
-        messages.append({
-            "role": "assistant",
-            "content": message.content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in message.tool_calls
-            ],
+        tool_name, args = parsed
+        log_step(session_id, step, "tool_call", {
+            "tool": tool_name,
+            "args": args,
+            "llm_latency_s": llm_latency,
         })
 
-        for tc in message.tool_calls:
-            tool_name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                args = {}
+        _TOOL_METRICS.set({})
+        t1 = time.time()
+        tool_result = run_tool(tool_name, args, collection_name)
+        tool_latency = round(time.time() - t1, 2)
+        tool_metrics = _TOOL_METRICS.get({})
+        total_embed_ms += tool_metrics.get("embed_ms", 0) or 0
+        total_chroma_ms += tool_metrics.get("chroma_ms", 0) or 0
 
-            log_step(session_id, step, "tool_call", {
-                "tool": tool_name,
-                "args": args,
-                "llm_latency_s": llm_latency,
-            })
+        result_str = str(tool_result)
+        log_step(session_id, step, "tool_result", {
+            "tool": tool_name,
+            "result_preview": result_str[:200],
+            "result_chars": len(result_str),
+            "tool_latency_s": tool_latency,
+            **tool_metrics,
+        })
 
-            _TOOL_METRICS.set({})
-            t1 = time.time()
-            result = run_tool(tool_name, args, collection_name)
-            tool_latency = round(time.time() - t1, 2)
-            tool_metrics = _TOOL_METRICS.get({})
-
-            result_str = str(result)
-            log_step(session_id, step, "tool_result", {
-                "tool": tool_name,
-                "result_preview": result_str[:200],
-                "result_chars": len(result_str),
-                "tool_latency_s": tool_latency,
-                **tool_metrics,
-            })
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result_str,
-            })
+        # Extend scratchpad with this step
+        scratchpad += raw + f"\nObservation: {result_str}\n\n"
 
     total_latency = round(time.time() - run_start, 2)
     log_step(session_id, max_steps, "max_steps_reached", {})
@@ -237,13 +201,15 @@ def run_agent(
         "query": user_query[:200],
         "steps": max_steps,
         "stop_reason": "max_steps_reached",
+        "embed_ms": total_embed_ms or None,
+        "chroma_ms": total_chroma_ms or None,
         "total_latency_s": total_latency,
     })
     return {
         "session_id": session_id,
         "answer": "I couldn't find a complete answer after max steps.",
         "steps": max_steps,
-        "messages": messages,
+        "messages": [{"role": "assistant", "content": scratchpad}],
     }
 
 
@@ -258,8 +224,3 @@ if __name__ == "__main__":
     print("FINAL ANSWER:")
     print(result["answer"])
     print(f"\nSteps: {result['steps']}")
-    if "usage" in result:
-        print(
-            f"Tokens: {result['usage']['input_tokens']} in / "
-            f"{result['usage']['output_tokens']} out"
-        )

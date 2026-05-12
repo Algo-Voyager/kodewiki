@@ -74,23 +74,90 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
     trigger=inngest.TriggerEvent(event="repomind/run_agent"),
 )
 async def run_agent_fn(ctx: inngest.Context) -> dict:
-    """Run the full ReAct agent loop as a durable background job."""
-    from agent import run_agent  # lazy import — avoids circular dep at module load
+    """ReAct loop driven step-by-step so each tool call is a visible Inngest checkpoint."""
+    import time
+    import uuid
+    from agent import _generate, _parse_action, query_rewrite
+    from prompts import REACT_PROMPT_TEMPLATE
+    from tools import _TOOL_METRICS, run_tool
 
     query: str = ctx.event.data["query"]
     collection_name: str = ctx.event.data["collection_name"]
+    session_id = str(uuid.uuid4())
+    run_start = time.time()
 
-    result = await ctx.step.run(
-        "agent-loop",
-        lambda: asyncio.get_event_loop().run_in_executor(
-            None, lambda: run_agent(query, collection_name)
-        ),
+    # Step 1 — rewrite the query for semantic search
+    rewritten: str = await ctx.step.run(
+        "query-rewrite",
+        lambda: query_rewrite(query),
     )
 
-    session_id = result.get("session_id", "")
-    if session_id:
-        _RESULT_CACHE[session_id] = result
-    logger.info("repomind/run_agent done: session=%s steps=%s", session_id, result.get("steps"))
+    scratchpad = ""
+
+    for step_num in range(1, 7):
+        prompt = REACT_PROMPT_TEMPLATE.format(
+            question=query,
+            rewritten=rewritten,
+            scratchpad=scratchpad,
+        )
+
+        # LLM generate — step so timing is visible in Inngest and result is memoized on retry
+        raw: str = await ctx.step.run(
+            f"llm-generate-{step_num}",
+            lambda p=prompt: _generate(p, max_new_tokens=1000, temperature=0.2),
+        )
+
+        if "Final Answer:" in raw:
+            answer = raw.split("Final Answer:", 1)[-1].strip()
+            result = {
+                "session_id": session_id,
+                "answer": answer,
+                "steps": step_num,
+                "total_latency_s": round(time.time() - run_start, 2),
+            }
+            _RESULT_CACHE[session_id] = result
+            logger.info("repomind/run_agent done: session=%s steps=%d", session_id, step_num)
+            return result
+
+        parsed = _parse_action(raw)
+        if parsed is None:
+            result = {
+                "session_id": session_id,
+                "answer": raw,
+                "steps": step_num,
+                "total_latency_s": round(time.time() - run_start, 2),
+            }
+            _RESULT_CACHE[session_id] = result
+            return result
+
+        tool_name, args = parsed
+
+        # Each tool call is its own step — vector_search gets a descriptive label
+        if tool_name == "vector_search":
+            step_label = f"vector-search-{step_num}"
+        else:
+            step_label = f"{tool_name}-{step_num}"
+
+        def _run_tool(tn=tool_name, a=args) -> dict:
+            _TOOL_METRICS.set({})
+            res = run_tool(tn, a, collection_name)
+            m = _TOOL_METRICS.get({})
+            return {
+                "result": res,
+                "embed_ms": m.get("embed_ms"),
+                "chroma_ms": m.get("chroma_ms"),
+            }
+
+        step_out: dict = await ctx.step.run(step_label, _run_tool)
+        scratchpad += raw + f"\nObservation: {step_out['result']}\n\n"
+
+    result = {
+        "session_id": session_id,
+        "answer": "Could not find a complete answer after max steps.",
+        "steps": 6,
+        "total_latency_s": round(time.time() - run_start, 2),
+    }
+    _RESULT_CACHE[session_id] = result
     return result
 
 

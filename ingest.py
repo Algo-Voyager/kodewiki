@@ -22,8 +22,10 @@ from pathlib import Path
 from typing import Iterable
 
 import chromadb
-import ollama
+import openai
 from dotenv import load_dotenv
+
+load_dotenv()
 from github import Auth, Github, GithubException, RateLimitExceededException
 from github.ContentFile import ContentFile
 from github.Repository import Repository
@@ -240,8 +242,23 @@ def fetch_file_bytes(gh: Github, entry: ContentFile) -> bytes | None:
             return None
 
 
+_embed_client: openai.OpenAI | None = None
+
+
+def _get_embed_client() -> openai.OpenAI:
+    global _embed_client
+    if _embed_client is None:
+        _embed_client = openai.OpenAI(
+            base_url=os.getenv("EMBED_BASE_URL"),
+            api_key=os.getenv("VLLM_API_KEY", ""),
+        )
+    return _embed_client
+
+
 def embed(text: str) -> list[float]:
-    return ollama.embeddings(model="nomic-embed-text", prompt=text)["embedding"]
+    model = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+    resp = _get_embed_client().embeddings.create(input=[text], model=model)
+    return resp.data[0].embedding
 
 
 def fetch_and_chunk_repo(repo_slug: str, mode: str, event_id: str = "cli") -> dict:
