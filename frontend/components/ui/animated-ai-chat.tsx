@@ -97,7 +97,7 @@ export const AnimatedTextarea = React.forwardRef<
       />
       {showRing && isFocused && (
         <motion.span
-          className="absolute inset-0 rounded-md pointer-events-none ring-2 ring-offset-0 ring-violet-500/30"
+          className="absolute inset-0 rounded-md pointer-events-none ring-2 ring-offset-0 ring-sky-500/30"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
@@ -271,9 +271,9 @@ export function AnimatedAIChat() {
   return (
     <div className="min-h-screen flex flex-col w-full items-center justify-center bg-transparent text-white p-6 relative overflow-hidden">
       <div className="absolute inset-0 w-full h-full overflow-hidden">
-        <div className="absolute top-0 left-1/4 w-96 h-96 bg-violet-500/10 rounded-full filter blur-[128px] animate-pulse" />
-        <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-indigo-500/10 rounded-full filter blur-[128px] animate-pulse delay-700" />
-        <div className="absolute top-1/4 right-1/3 w-64 h-64 bg-fuchsia-500/10 rounded-full filter blur-[96px] animate-pulse delay-1000" />
+        <div className="absolute top-0 left-1/4 w-96 h-96 bg-sky-500/10 rounded-full filter blur-[128px] animate-pulse" />
+        <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-blue-500/10 rounded-full filter blur-[128px] animate-pulse delay-700" />
+        <div className="absolute top-1/4 right-1/3 w-64 h-64 bg-cyan-500/10 rounded-full filter blur-[96px] animate-pulse delay-1000" />
       </div>
 
       <div className="w-full max-w-2xl mx-auto relative">
@@ -505,7 +505,7 @@ export function AnimatedAIChat() {
 
       {inputFocused && (
         <motion.div
-          className="fixed w-[50rem] h-[50rem] rounded-full pointer-events-none z-0 opacity-[0.02] bg-gradient-to-r from-violet-500 via-fuchsia-500 to-indigo-500 blur-[96px]"
+          className="fixed w-[50rem] h-[50rem] rounded-full pointer-events-none z-0 opacity-[0.02] bg-gradient-to-r from-sky-500 via-cyan-400 to-blue-500 blur-[96px]"
           animate={{ x: mousePosition.x - 400, y: mousePosition.y - 400 }}
           transition={{ type: "spring", damping: 25, stiffness: 150, mass: 0.5 }}
         />

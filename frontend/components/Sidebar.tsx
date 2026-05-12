@@ -30,19 +30,19 @@ const NAV = [
     href: "/chat",
     label: "Chat",
     icon: MessageSquare,
-    color: "text-violet-400",
-    bg: "bg-violet-500/15",
-    activeBg: "bg-violet-500/20",
-    activeBorder: "border-violet-500/30",
+    color: "text-sky-400",
+    bg: "bg-sky-500/15",
+    activeBg: "bg-sky-500/20",
+    activeBorder: "border-sky-500/30",
   },
   {
     href: "/logs",
     label: "Logs",
     icon: ScrollText,
-    color: "text-sky-400",
-    bg: "bg-sky-500/15",
-    activeBg: "bg-sky-500/20",
-    activeBorder: "border-sky-500/30",
+    color: "text-teal-400",
+    bg: "bg-teal-500/15",
+    activeBg: "bg-teal-500/20",
+    activeBorder: "border-teal-500/30",
   },
   {
     href: "/benchmarks",
@@ -140,13 +140,13 @@ export function Sidebar() {
         onMouseDown={onDragStart}
         className={cn(
           "absolute top-0 right-0 h-full w-1 z-50 cursor-col-resize group transition-colors",
-          isDragging ? "bg-violet-500/60" : "hover:bg-violet-500/40"
+          isDragging ? "bg-sky-500/60" : "hover:bg-sky-500/40"
         )}
       >
         {/* Centre dots */}
         <div className="absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
           {[0, 1, 2].map((i) => (
-            <div key={i} className="w-1 h-1 rounded-full bg-violet-400/80" />
+            <div key={i} className="w-1 h-1 rounded-full bg-sky-400/80" />
           ))}
         </div>
       </div>
@@ -156,7 +156,7 @@ export function Sidebar() {
         <div className="flex items-center gap-3">
           {/* Logo mark */}
           <div className="relative shrink-0">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-violet-500/30">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-sky-500 to-blue-600 flex items-center justify-center shadow-lg shadow-sky-500/30">
               <Zap className="w-4 h-4 text-white" />
             </div>
             <div className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-green-400 border-2 border-[#0d0d10]" />
@@ -224,7 +224,7 @@ export function Sidebar() {
           value={repo}
           onChange={(e) => setRepo(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && handleIngest()}
-          className="h-8 text-xs rounded-lg bg-white/[0.04] border-white/[0.08] text-white/80 placeholder:text-white/20 focus-visible:ring-violet-500/40 focus-visible:border-violet-500/40"
+          className="h-8 text-xs rounded-lg bg-white/[0.04] border-white/[0.08] text-white/80 placeholder:text-white/20 focus-visible:ring-sky-500/40 focus-visible:border-sky-500/40"
         />
 
         {/* AST / Naive toggle */}
@@ -236,7 +236,7 @@ export function Sidebar() {
               className={cn(
                 "flex-1 py-1 rounded-md text-[11px] font-semibold tracking-wide transition-all",
                 mode === m
-                  ? "bg-violet-500 text-white shadow-sm shadow-violet-500/30"
+                  ? "bg-sky-500 text-white shadow-sm shadow-sky-500/30"
                   : "text-white/30 hover:text-white/60"
               )}
             >
@@ -252,8 +252,8 @@ export function Sidebar() {
             size="sm"
             className={cn(
               "w-full h-8 text-xs rounded-lg font-semibold tracking-wide transition-all",
-              "bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500",
-              "text-white border-0 shadow-md shadow-violet-500/20"
+              "bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500",
+              "text-white border-0 shadow-md shadow-sky-500/20"
             )}
           >
             {loading ? (
@@ -320,21 +320,21 @@ export function Sidebar() {
                   className={cn(
                     "flex items-center justify-between w-full px-2.5 py-2 rounded-xl text-left transition-all border",
                     isActive
-                      ? "bg-violet-500/10 border-violet-500/25 text-white"
+                      ? "bg-sky-500/10 border-sky-500/25 text-white"
                       : "border-transparent text-white/40 hover:bg-white/[0.04] hover:text-white/70"
                   )}
                 >
                   <div className="flex items-center gap-2 min-w-0">
                     <div className={cn(
                       "w-1.5 h-1.5 rounded-full shrink-0",
-                      isActive ? "bg-violet-400" : "bg-white/20"
+                      isActive ? "bg-sky-400" : "bg-white/20"
                     )} />
                     <span className="text-[11px] font-medium truncate">{col.name}</span>
                   </div>
                   <span className={cn(
                     "shrink-0 ml-1.5 text-[10px] font-mono px-1.5 py-0.5 rounded-md",
                     isActive
-                      ? "bg-violet-500/20 text-violet-300"
+                      ? "bg-sky-500/20 text-sky-300"
                       : "bg-white/[0.06] text-white/30"
                   )}>
                     {col.chunk_count}
@@ -360,7 +360,7 @@ export function Sidebar() {
           href="http://localhost:8288"
           target="_blank"
           rel="noreferrer"
-          className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-[10px] text-white/30 hover:text-violet-400 hover:bg-violet-500/5 transition-all"
+          className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-[10px] text-white/30 hover:text-sky-400 hover:bg-sky-500/5 transition-all"
         >
           <ExternalLink className="w-3 h-3 shrink-0" />
           <span>Inngest Dev UI</span>

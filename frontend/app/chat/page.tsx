@@ -31,7 +31,7 @@ const HINT_QUESTIONS = [
 
 function BotAvatar() {
   return (
-    <div className="flex-shrink-0 w-7 h-7 rounded-full bg-violet-500/20 border border-violet-500/30 flex items-center justify-center text-xs font-bold text-violet-300">
+    <div className="flex-shrink-0 w-7 h-7 rounded-full bg-sky-500/20 border border-sky-500/30 flex items-center justify-center text-xs font-bold text-sky-300">
       RM
     </div>
   );
@@ -192,8 +192,8 @@ export default function ChatPage() {
       <div className="flex flex-col flex-1 items-center justify-center relative overflow-hidden">
         {/* Gradient blobs */}
         <div className="absolute inset-0 pointer-events-none">
-          <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-violet-500/10 rounded-full filter blur-[128px] animate-pulse" />
-          <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-indigo-500/10 rounded-full filter blur-[128px] animate-pulse delay-700" />
+          <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-sky-500/10 rounded-full filter blur-[128px] animate-pulse" />
+          <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-blue-500/10 rounded-full filter blur-[128px] animate-pulse delay-700" />
         </div>
         <motion.div
           className="relative z-10 text-center space-y-3"
@@ -201,7 +201,7 @@ export default function ChatPage() {
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.5 }}
         >
-          <div className="w-14 h-14 rounded-2xl bg-violet-500/10 border border-violet-500/20 flex items-center justify-center text-2xl font-bold text-violet-300 mx-auto">
+          <div className="w-14 h-14 rounded-2xl bg-sky-500/10 border border-sky-500/20 flex items-center justify-center text-2xl font-bold text-sky-300 mx-auto">
             RM
           </div>
           <p className="text-base font-medium text-foreground">No repository selected</p>
@@ -218,8 +218,8 @@ export default function ChatPage() {
     <div className="flex flex-col flex-1 min-h-0 relative overflow-hidden">
       {/* Subtle gradient blobs in background */}
       <div className="absolute inset-0 pointer-events-none overflow-hidden">
-        <div className="absolute -top-32 -left-32 w-96 h-96 bg-violet-500/5 rounded-full filter blur-[128px]" />
-        <div className="absolute -bottom-32 -right-32 w-96 h-96 bg-indigo-500/5 rounded-full filter blur-[128px]" />
+        <div className="absolute -top-32 -left-32 w-96 h-96 bg-sky-500/5 rounded-full filter blur-[128px]" />
+        <div className="absolute -bottom-32 -right-32 w-96 h-96 bg-blue-500/5 rounded-full filter blur-[128px]" />
       </div>
 
       {/* Header */}
@@ -232,7 +232,7 @@ export default function ChatPage() {
         <motion.div
           className={cn(
             "w-2 h-2 rounded-full shrink-0",
-            isCurrentLoading ? "bg-violet-400" : "bg-green-400"
+            isCurrentLoading ? "bg-sky-400" : "bg-green-400"
           )}
           animate={isCurrentLoading ? { opacity: [1, 0.4, 1] } : { opacity: 1 }}
           transition={isCurrentLoading ? { duration: 1.2, repeat: Infinity } : {}}
@@ -267,7 +267,7 @@ export default function ChatPage() {
                     setInput(hint);
                     textareaRef.current?.focus();
                   }}
-                  className="text-xs px-3 py-1.5 rounded-full border border-border text-muted-foreground hover:text-foreground hover:border-violet-500/50 hover:bg-violet-500/5 transition-all"
+                  className="text-xs px-3 py-1.5 rounded-full border border-border text-muted-foreground hover:text-foreground hover:border-sky-500/50 hover:bg-sky-500/5 transition-all"
                   whileHover={{ scale: 1.03 }}
                   whileTap={{ scale: 0.97 }}
                 >
@@ -343,8 +343,8 @@ export default function ChatPage() {
             exit={{ opacity: 0, y: 10 }}
           >
             <div className="flex items-center gap-3">
-              <div className="w-6 h-6 rounded-full bg-violet-500/20 border border-violet-500/30 flex items-center justify-center">
-                <span className="text-[10px] font-bold text-violet-300">RM</span>
+              <div className="w-6 h-6 rounded-full bg-sky-500/20 border border-sky-500/30 flex items-center justify-center">
+                <span className="text-[10px] font-bold text-sky-300">RM</span>
               </div>
               <div className="flex items-center gap-1.5 text-xs text-white/70">
                 <span>Thinking</span>
@@ -422,7 +422,7 @@ export default function ChatPage() {
               <div className="flex items-center gap-2">
                 {isCurrentLoading && currentQueueCount > 0 && (
                   <motion.span
-                    className="text-xs text-violet-400/80"
+                    className="text-xs text-sky-400/80"
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                   >
@@ -439,7 +439,7 @@ export default function ChatPage() {
                     "flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-sm font-medium transition-all",
                     input.trim()
                       ? isCurrentLoading
-                        ? "bg-violet-500/20 text-violet-300 border border-violet-500/30"
+                        ? "bg-sky-500/20 text-sky-300 border border-sky-500/30"
                         : "bg-primary text-primary-foreground shadow-lg"
                       : "bg-white/[0.04] text-muted-foreground"
                   )}
@@ -471,7 +471,7 @@ export default function ChatPage() {
       {/* Mouse-follow gradient when input is focused */}
       {inputFocused && (
         <motion.div
-          className="fixed w-[40rem] h-[40rem] rounded-full pointer-events-none z-0 opacity-[0.025] bg-gradient-to-r from-violet-500 via-fuchsia-500 to-indigo-500 blur-[96px]"
+          className="fixed w-[40rem] h-[40rem] rounded-full pointer-events-none z-0 opacity-[0.025] bg-gradient-to-r from-sky-500 via-cyan-400 to-blue-500 blur-[96px]"
           animate={{ x: mousePosition.x - 320, y: mousePosition.y - 320 }}
           transition={{ type: "spring", damping: 25, stiffness: 150, mass: 0.5 }}
         />
