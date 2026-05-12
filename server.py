@@ -35,8 +35,12 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+import chromadb
+
+from eval.metrics import compute_aggregate_metrics
 from ingest import embed_and_store_chunks, fetch_and_chunk_repo
 from inngest_setup import inngest_client
+from logger import get_recent_logs, get_session_logs
 
 logger = logging.getLogger("uvicorn")
 
@@ -63,11 +67,12 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
     mode: str = ctx.event.data.get("mode", "ast")
     event_id: str = ctx.event.id
 
-    # Step 1: fetch and chunk
-    chunks_data = await ctx.step.run(
-        "fetch-and-chunk",
-        lambda: fetch_and_chunk_repo(repo_slug, mode, event_id=event_id),
-    )
+    # Step 1: fetch and chunk — async so PyGithub HTTP calls don't block the loop
+    async def _fetch_and_chunk() -> dict:
+        import asyncio as _aio
+        return await _aio.to_thread(fetch_and_chunk_repo, repo_slug, mode, event_id)  # positional OK
+
+    chunks_data = await ctx.step.run("fetch-and-chunk", _fetch_and_chunk)
 
     # Step 2: validate before embedding
     def _validate(d: dict) -> dict:
@@ -85,11 +90,12 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
 
     validated = await ctx.step.run("validate-chunks", lambda: _validate(chunks_data))
 
-    # Step 3: embed and store
-    result = await ctx.step.run(
-        "embed-and-store",
-        lambda: embed_and_store_chunks(chunks_data),
-    )
+    # Step 3: embed and store — async so Modal embed API calls don't block the loop
+    async def _embed_and_store() -> dict:
+        import asyncio as _aio
+        return await _aio.to_thread(embed_and_store_chunks, chunks_data)
+
+    result = await ctx.step.run("embed-and-store", _embed_and_store)
 
     # Step 4: log summary
     def _log_summary(r: dict, v: dict) -> dict:
@@ -141,12 +147,13 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
     session_id: str = ctx.event.data.get("session_id") or ctx.event.id
     run_start = time.time()
 
-    # Step: query-rewrite — log_step is inside the lambda so it only runs once,
-    # not on every Inngest replay.
-    def _query_rewrite() -> str:
+    # Step: query-rewrite — async so the blocking httpx.post doesn't freeze the
+    # event loop; log_step runs inside so it only fires once (not on replays).
+    async def _query_rewrite() -> str:
+        import asyncio as _aio
         import time as _t
         t = _t.time()
-        result = query_rewrite(query)
+        result = await _aio.to_thread(query_rewrite, query)
         log_step(session_id, 0, "query_rewrite", {
             "original": query,
             "rewritten": result,
@@ -170,16 +177,16 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
             scratchpad=scratchpad,
         )
 
-        # Step: llm-generate-N
-        raw: str = await ctx.step.run(
-            f"llm-generate-{step_num}",
-            lambda p=prompt: _generate(p, max_new_tokens=1000, temperature=0.2),
-        )
+        # Step: llm-generate-N — async to avoid blocking the event loop
+        async def _llm_generate(p: str = prompt) -> str:
+            import asyncio as _aio
+            return await _aio.to_thread(_generate, p, 1000, 0.2)
+
+        raw: str = await ctx.step.run(f"llm-generate-{step_num}", _llm_generate)
 
         if "Final Answer:" in raw:
             answer = raw.split("Final Answer:", 1)[-1].strip()
             stop_reason = "final_answer"
-            # Log inside its own step so it runs exactly once
             _ans, _sn = answer, step_num
             await ctx.step.run(
                 f"log-final-answer-{step_num}",
@@ -208,14 +215,15 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
             else f"{tool_name}-{step_num}"
         )
 
-        # Tool step: log_step for tool_call and tool_result are inside the
-        # lambda so they execute exactly once even across Inngest replays.
-        def _run_tool(tn=tool_name, a=args, sn=step_num) -> dict:
+        # Tool step: async so embed + chroma calls don't block the event loop.
+        # log_step calls are inside so they only fire once across Inngest replays.
+        async def _run_tool(tn: str = tool_name, a: str = args, sn: int = step_num) -> dict:
+            import asyncio as _aio
             import time as _t
             log_step(session_id, sn, "tool_call", {"tool": tn, "args": a})
             _TOOL_METRICS.set({})
             t = _t.time()
-            res = run_tool(tn, a, collection_name)
+            res = await _aio.to_thread(run_tool, tn, a, collection_name)
             tool_latency = round(_t.time() - t, 2)
             m = _TOOL_METRICS.get({})
             result_str = str(res)
@@ -353,6 +361,51 @@ async def get_result(session_id: str):
     if result is None:
         raise HTTPException(status_code=404, detail="result not ready yet")
     return result
+
+
+@app.get("/api/collections")
+async def list_collections():
+    """List all ChromaDB collections with chunk counts."""
+    try:
+        client = chromadb.PersistentClient(path="./chroma_db")
+        result = []
+        for col in client.list_collections():
+            try:
+                count = client.get_collection(col.name).count()
+            except Exception:
+                count = 0
+            result.append({"name": col.name, "chunk_count": count})
+        return {"collections": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/logs")
+async def recent_logs(limit: int = 50):
+    """Return the most recent agent log entries."""
+    try:
+        return {"logs": get_recent_logs(limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/logs/{session_id}")
+async def session_logs(session_id: str):
+    """Return all log entries for a specific session."""
+    try:
+        return {"logs": get_session_logs(session_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/metrics")
+async def aggregate_metrics():
+    """Return aggregate metrics across all sessions."""
+    try:
+        metrics = compute_aggregate_metrics()
+        return metrics or {}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
