@@ -6,6 +6,20 @@ max_steps is hit.
 
     LLM ──▶ parse Action ──▶ run_tool ──▶ Observation ──▶ LLM ...
                               ──▶ Final Answer ──▶ return
+
+Inngest visibility (Streamlit path):
+  Every meaningful stage fires a repomind/streamlit_step event so the
+  Inngest Dev UI shows per-step latency for the synchronous Streamlit
+  flow — same visibility as the async ctx.step.run path in server.py.
+
+  Checkpoints fired:
+    query_rewrite       — LLM rewrite latency + result
+    query_rewrite_error — if the rewrite LLM call fails
+    llm_generate        — per-iteration LLM latency + parsed action
+    llm_generate_error  — if the generate call throws
+    tool_call           — per-tool latency, embed_ms, chroma_ms, result size
+    tool_call_error     — if run_tool raises
+    final_answer        — total latency, steps, stop reason
 """
 
 from __future__ import annotations
@@ -46,19 +60,24 @@ def _generate(prompt: str, max_new_tokens: int = 512, temperature: float = 0.2) 
     return resp.json()["response"].strip()
 
 
-def _fire_monitoring_event(data: dict) -> None:
+def _send_event(name: str, data: dict) -> None:
+    """Fire-and-forget event to Inngest Dev Server (daemon thread, never blocks)."""
     def _send() -> None:
         try:
             url = os.getenv("INNGEST_DEV_EVENT_URL", "http://localhost:8288/e/repomind-dev")
-            httpx.post(
-                url,
-                json=[{"name": "repomind/agent_completed", "data": data}],
-                timeout=2.0,
-            )
+            httpx.post(url, json=[{"name": name, "data": data}], timeout=2.0)
         except Exception:
             pass
-
     threading.Thread(target=_send, daemon=True).start()
+
+
+def _fire_monitoring_event(data: dict) -> None:
+    _send_event("repomind/agent_completed", data)
+
+
+def _fire_step_event(session_id: str, step: str, data: dict) -> None:
+    """Fire a repomind/streamlit_step event for Streamlit path checkpoint visibility."""
+    _send_event("repomind/streamlit_step", {"session_id": session_id, "step": step, **data})
 
 
 def query_rewrite(user_query: str) -> str:
@@ -98,7 +117,22 @@ def run_agent(
     session_id = str(uuid.uuid4())
     run_start = time.time()
 
-    rewritten = query_rewrite(user_query)
+    # ── Checkpoint: query_rewrite ────────────────────────────────────────────
+    t0 = time.time()
+    try:
+        rewritten = query_rewrite(user_query)
+    except Exception as e:
+        _fire_step_event(session_id, "query_rewrite_error", {
+            "error": str(e),
+            "query": user_query[:200],
+        })
+        raise
+
+    _fire_step_event(session_id, "query_rewrite", {
+        "latency_ms": round((time.time() - t0) * 1000),
+        "original_query": user_query[:200],
+        "rewritten": rewritten[:200],
+    })
     log_step(session_id, 0, "query_rewrite", {
         "original": user_query,
         "rewritten": rewritten,
@@ -115,19 +149,45 @@ def run_agent(
             scratchpad=scratchpad,
         )
 
+        # ── Checkpoint: llm_generate ─────────────────────────────────────────
         t0 = time.time()
-        raw = _generate(prompt, max_new_tokens=1000, temperature=0.2)
+        try:
+            raw = _generate(prompt, max_new_tokens=1000, temperature=0.2)
+        except Exception as e:
+            llm_latency_ms = round((time.time() - t0) * 1000)
+            _fire_step_event(session_id, "llm_generate_error", {
+                "step_num": step,
+                "latency_ms": llm_latency_ms,
+                "error": str(e),
+            })
+            log_step(session_id, step, "llm_error", {"error": str(e)})
+            raise
+
         llm_latency = round(time.time() - t0, 2)
+        llm_latency_ms = round(llm_latency * 1000)
 
         # Final answer check
         if "Final Answer:" in raw:
             answer = raw.split("Final Answer:", 1)[-1].strip()
             total_latency = round(time.time() - run_start, 2)
+
+            _fire_step_event(session_id, "llm_generate", {
+                "step_num": step,
+                "latency_ms": llm_latency_ms,
+                "action": "final_answer",
+            })
             log_step(session_id, step, "final_answer", {
                 "answer": answer,
                 "llm_latency_s": llm_latency,
                 "total_latency_s": total_latency,
                 "total_steps": step,
+            })
+            _fire_step_event(session_id, "final_answer", {
+                "total_latency_ms": round(total_latency * 1000),
+                "total_steps": step,
+                "stop_reason": "stop",
+                "embed_ms": total_embed_ms or None,
+                "chroma_ms": total_chroma_ms or None,
             })
             _fire_monitoring_event({
                 "session_id": session_id,
@@ -148,9 +208,20 @@ def run_agent(
         # Parse tool call
         parsed = _parse_action(raw)
         if parsed is None:
-            # Model gave a plain response without Action or Final Answer
             total_latency = round(time.time() - run_start, 2)
+            _fire_step_event(session_id, "llm_generate", {
+                "step_num": step,
+                "latency_ms": llm_latency_ms,
+                "action": "no_action",
+            })
             log_step(session_id, step, "unexpected_stop", {"llm_latency_s": llm_latency})
+            _fire_step_event(session_id, "final_answer", {
+                "total_latency_ms": round(total_latency * 1000),
+                "total_steps": step,
+                "stop_reason": "no_action",
+                "embed_ms": total_embed_ms or None,
+                "chroma_ms": total_chroma_ms or None,
+            })
             _fire_monitoring_event({
                 "session_id": session_id,
                 "query": user_query[:200],
@@ -168,21 +239,49 @@ def run_agent(
             }
 
         tool_name, args = parsed
+        _fire_step_event(session_id, "llm_generate", {
+            "step_num": step,
+            "latency_ms": llm_latency_ms,
+            "action": tool_name,
+        })
         log_step(session_id, step, "tool_call", {
             "tool": tool_name,
             "args": args,
             "llm_latency_s": llm_latency,
         })
 
+        # ── Checkpoint: tool_call ────────────────────────────────────────────
         _TOOL_METRICS.set({})
         t1 = time.time()
-        tool_result = run_tool(tool_name, args, collection_name)
+        try:
+            tool_result = run_tool(tool_name, args, collection_name)
+        except Exception as e:
+            tool_latency_ms = round((time.time() - t1) * 1000)
+            _fire_step_event(session_id, "tool_call_error", {
+                "step_num": step,
+                "tool": tool_name,
+                "latency_ms": tool_latency_ms,
+                "error": str(e),
+            })
+            log_step(session_id, step, "tool_error", {"tool": tool_name, "error": str(e)})
+            raise
+
         tool_latency = round(time.time() - t1, 2)
         tool_metrics = _TOOL_METRICS.get({})
-        total_embed_ms += tool_metrics.get("embed_ms", 0) or 0
-        total_chroma_ms += tool_metrics.get("chroma_ms", 0) or 0
+        embed_ms = tool_metrics.get("embed_ms") or 0
+        chroma_ms = tool_metrics.get("chroma_ms") or 0
+        total_embed_ms += embed_ms
+        total_chroma_ms += chroma_ms
 
         result_str = str(tool_result)
+        _fire_step_event(session_id, "tool_call", {
+            "step_num": step,
+            "tool": tool_name,
+            "latency_ms": round(tool_latency * 1000),
+            "embed_ms": embed_ms or None,
+            "chroma_ms": chroma_ms or None,
+            "result_chars": len(result_str),
+        })
         log_step(session_id, step, "tool_result", {
             "tool": tool_name,
             "result_preview": result_str[:200],
@@ -191,11 +290,18 @@ def run_agent(
             **tool_metrics,
         })
 
-        # Extend scratchpad with this step
         scratchpad += raw + f"\nObservation: {result_str}\n\n"
 
+    # ── Checkpoint: max_steps_reached ────────────────────────────────────────
     total_latency = round(time.time() - run_start, 2)
     log_step(session_id, max_steps, "max_steps_reached", {})
+    _fire_step_event(session_id, "final_answer", {
+        "total_latency_ms": round(total_latency * 1000),
+        "total_steps": max_steps,
+        "stop_reason": "max_steps_reached",
+        "embed_ms": total_embed_ms or None,
+        "chroma_ms": total_chroma_ms or None,
+    })
     _fire_monitoring_event({
         "session_id": session_id,
         "query": user_query[:200],

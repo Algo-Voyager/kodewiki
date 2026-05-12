@@ -6,13 +6,15 @@ A developer documentation agent: point it at a GitHub repo, and ask questions ab
 
 | Layer | Technology |
 |-------|-----------|
-| **LLM** | `Qwen/Qwen2.5-7B-Instruct` via [vLLM](https://github.com/vllm-project/vllm) on Modal — OpenAI-compatible |
-| **LLM client** | `openai` Python SDK with custom `base_url` |
-| **Embeddings** | `BAAI/bge-small-en-v1.5` via `sentence-transformers` on Modal — OpenAI-compatible |
+| **LLM** | `Qwen/Qwen2.5-7B-Instruct` on Modal via rag-learning's `QwenService` (custom `/generate` endpoint) |
+| **LLM client** | `httpx` — direct POST to `QWEN_GENERATE_URL` |
+| **Agent loop** | Text-based ReAct (Thought → Action → Observation → Final Answer) |
+| **Embeddings** | `BAAI/bge-small-en-v1.5` on Modal via rag-learning's `embedding_api` — OpenAI-compatible `/v1/embeddings` |
+| **Embed client** | `openai` Python SDK pointed at `EMBED_BASE_URL` |
 | **Vector DB** | ChromaDB (persistent, stored in `./chroma_db`) |
 | **GitHub API** | PyGithub |
 | **UI** | Streamlit |
-| **Background jobs** | [Inngest](https://www.inngest.com) via FastAPI — repo ingestion runs as a durable 2-step job; every agent run fires a monitoring event |
+| **Background jobs** | [Inngest](https://www.inngest.com) via FastAPI — ingest runs as a 2-step durable job; agent runs are broken into per-step checkpoints |
 
 No LangChain. No LlamaIndex. Everything is built from scratch.
 
@@ -37,26 +39,18 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 4. Deploy both models to Modal
+### 4. Deploy rag-learning Modal services
 
-Both the LLM and embedding model run on Modal — nothing runs locally.
+Both the LLM and embeddings run on Modal under the `qwen-7b-service` app (shared with rag-learning). Deploy once from the rag-learning repo:
 
 ```bash
-# One-time: install Modal and authenticate
-pip install modal
-modal token new
-
-# Create secrets
-modal secret create huggingface-secret HF_TOKEN=hf_xxx   # leave empty if not needed
-modal secret create vllm-api-key VLLM_API_KEY=<long-random-string>
-
-# Deploy — prints two public URLs
-.venv/bin/modal deploy deploy/qwen_modal.py
+cd ../rag-learning
+modal deploy qwen_modal.py
 ```
 
 Modal prints two URLs:
-- **LLM**: `https://<workspace>--repomind-vllm-serve.modal.run`
-- **Embeddings**: `https://<workspace>--repomind-vllm-embedding-api.modal.run`
+- **LLM generate**: `https://<workspace>--qwen-7b-service-qwenservice-generate.modal.run`
+- **Embeddings**: `https://<workspace>--qwen-7b-service-embedding-api.modal.run`
 
 To stop and clean up all Modal resources:
 
@@ -74,20 +68,19 @@ Edit `.env` and fill in:
 
 | Variable | Description |
 |----------|-------------|
-| `VLLM_API_KEY` | API key set in the `vllm-api-key` Modal secret |
-| `VLLM_BASE_URL` | LLM endpoint URL from Modal deploy + `/v1` |
-| `VLLM_MODEL` | `Qwen/Qwen2.5-7B-Instruct` |
-| `EMBED_BASE_URL` | Embedding endpoint URL from Modal deploy |
+| `VLLM_API_KEY` | API key shared by both Modal services |
+| `QWEN_GENERATE_URL` | LLM generate endpoint URL from Modal |
+| `EMBED_BASE_URL` | Embedding endpoint URL from Modal **+ `/v1`** |
 | `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` |
 | `GITHUB_TOKEN` | GitHub personal access token with repo read access |
 
-### 6. Start the FastAPI + Inngest backend
+> **Important:** `EMBED_BASE_URL` must end with `/v1` — the OpenAI SDK appends `/embeddings` to it, so the full path becomes `.../v1/embeddings`.
 
-The backend handles background ingestion jobs and agent run monitoring.
+### 6. Start the FastAPI + Inngest backend
 
 ```bash
 # Terminal 1 — FastAPI + Inngest server
-uvicorn server:app --reload --port 8000
+uvicorn server:app --port 8000
 ```
 
 ### 7. Start the Inngest Dev Server
@@ -108,15 +101,15 @@ streamlit run app.py
 
 The UI has three tabs:
 - **Chat** — ask the agent questions about an ingested repo
-- **Logs** — recent activity, latency, token usage, and estimated cost
+- **Logs** — recent activity, latency, and estimated cost
 - **Benchmarks** — AST vs naive chunking quality + correctness pass rate
 
-**Ingest a repo from the sidebar** — clicking "Ingest repo" triggers a background Inngest job (2 steps visible in the Dev UI: `fetch-and-chunk` → `embed-and-store`). The Streamlit sidebar returns immediately; watch progress at localhost:8288.
+**Ingest a repo from the sidebar** — clicking "Ingest repo" triggers a background Inngest job (2 steps: `fetch-and-chunk` → `embed-and-store`). Watch progress at localhost:8288.
 
 ### CLI usage (no server required)
 
 ```bash
-# Ingest directly (bypasses Inngest, useful for scripting)
+# Ingest directly (bypasses Inngest)
 python ingest.py <owner>/<repo> <ast|naive>
 
 # Single agent query
@@ -165,13 +158,87 @@ npx inngest-cli@latest dev -u http://localhost:8000/api/inngest
 
 Three Inngest functions run in the background:
 
-| Function | Trigger | Steps |
-|----------|---------|-------|
+| Function | Trigger | Steps visible in Dev UI |
+|----------|---------|------------------------|
 | `repomind/ingest_repo` | Sidebar "Ingest repo" button | `fetch-and-chunk` → `embed-and-store` |
-| `repomind/run_agent` | `POST /api/query` (async API path) | `agent-loop` |
-| `repomind/agent_completed` | After every Streamlit chat query | `compute-metrics` (cost, latency, tokens) |
+| `repomind/run_agent` | `POST /api/query` (async API path) | `query-rewrite` → `llm-generate-1` → `vector-search-1` → `llm-generate-2` → … |
+| `repomind/agent_completed` | After every Streamlit chat query | `compute-metrics` (latency, embed_ms, chroma_ms) |
 
-Inngest provides automatic retries, step-level error traces, and replay — visible at http://localhost:8288.
+Each step shows its own duration in the timeline. LLM generate steps are also memoized — on retry, already-completed steps are not re-called.
+
+## Architecture & Challenges
+
+### How the agent works
+
+```
+User question
+    │
+    ▼
+query-rewrite (Inngest step)       ← compact semantic search query
+    │
+    ▼
+ReAct loop (up to 6 iterations):
+    │
+    ├─ llm-generate-N (Inngest step)   ← Qwen generates Thought + Action
+    │       │
+    │       ├─ "Final Answer:" found → return answer
+    │       │
+    │       └─ Action parsed → tool call
+    │               │
+    │               └─ vector-search-N / get-file-N (Inngest step)
+    │                       │
+    │                       └─ Observation appended to prompt
+    ▼
+Final Answer returned to Streamlit
+```
+
+### Challenges faced and how they were solved
+
+**1. Embeddings: local Ollama → Modal**
+
+Initially embeddings used Ollama running locally (`nomic-embed-text`). This required every developer to run a local daemon and meant the model never worked in cloud environments.
+
+*Solution:* Deployed `BAAI/bge-small-en-v1.5` on Modal as an OpenAI-compatible `/v1/embeddings` endpoint using `sentence-transformers`. The `openai` SDK calls it the same way it would call any embedding API.
+
+*Gotcha:* `EMBED_BASE_URL` must include `/v1` (e.g. `.../v1` not just `...`) because the OpenAI SDK constructs the full URL as `base_url + /embeddings`. Without `/v1`, the path becomes `.../embeddings` which returns 404.
+
+---
+
+**2. vLLM cold-start timeout**
+
+The `repomind-vllm` Modal deployment kept failing. Qwen2.5-7B is ~14 GB of weights. On the first cold start (especially after volumes are deleted), vLLM needs to download and load all the weights before it can serve a request. The original `startup_timeout` was 10 minutes — exactly where the containers were dying.
+
+*Solution:* Increased `startup_timeout` to 20 minutes and removed `@modal.concurrent` which is not valid for `@modal.web_server` functions. Ultimately switched to reusing the already-stable `qwen-7b-service` deployment from rag-learning, which had its weights already cached.
+
+---
+
+**3. OpenAI tool-calling → text-based ReAct**
+
+The original agent used the OpenAI SDK's `tools=` parameter (function calling). This only works with OpenAI-compatible endpoints that support function calling (like vLLM). When switching to rag-learning's `QwenService`, the endpoint is a simple `POST /generate` that returns `{"response": "..."}` — no function calling support at all.
+
+*Solution:* Rewrote the agent as a text-based ReAct loop. The prompt tells the model to output:
+```
+Thought: I need to search the codebase
+Action: vector_search
+Action Input: {"query": "authentication login flow"}
+```
+The agent parses `Action:` and `Action Input:` via regex, runs the tool, and appends `Observation: <result>` back to the prompt. The model reads the observation and continues until it writes `Final Answer:`.
+
+---
+
+**4. Inngest visibility — all one black box**
+
+Originally the entire agent run was a single `agent-loop` Inngest step. You could see the total time but couldn't tell whether time was spent in the LLM, in vector search, or somewhere else.
+
+*Solution:* Restructured `run_agent_fn` in `server.py` to drive the ReAct loop itself, making each LLM call and each tool call its own `ctx.step.run`. Now the Inngest timeline shows individual durations for `llm-generate-1`, `vector-search-1`, etc. Steps are also memoized, so retries don't re-call the LLM for already-completed work.
+
+---
+
+**5. embed_ms / chroma_ms always null in monitoring**
+
+The `_TOOL_METRICS` ContextVar in `tools.py` correctly recorded embed and Chroma latency per tool call. But the monitoring event fired at the end of `run_agent` only included `session_id`, `steps`, and `total_latency_s` — the tool metrics were spread into `log_step` but never passed to `_fire_monitoring_event`.
+
+*Solution:* Added `total_embed_ms` and `total_chroma_ms` accumulators in `run_agent`, summing up metrics across all tool calls in the run, and included them in every `_fire_monitoring_event` payload.
 
 ## Evaluation
 
@@ -207,15 +274,15 @@ Reads `agent_logs.jsonl` and reports session counts, latency percentiles, token 
 repomind/
 ├── server.py              # FastAPI + Inngest server (3 functions, 3 REST endpoints)
 ├── inngest_setup.py       # Shared Inngest client singleton
-├── ingest.py              # Fetch repo, chunk (AST or naive), embed, write to Chroma
-├── agent.py               # ReAct loop via OpenAI SDK (vLLM-compatible) with tool dispatch
-├── tools.py               # Tool definitions (vector_search, get_file, get_recent_commits)
-├── prompts.py             # SYSTEM_PROMPT + QUERY_REWRITE_PROMPT
+├── ingest.py              # Fetch repo, chunk (AST or naive), embed via Modal, write to Chroma
+├── agent.py               # Text-based ReAct loop using httpx → QWEN_GENERATE_URL
+├── tools.py               # Tool implementations (vector_search, get_file, get_recent_commits)
+├── prompts.py             # REACT_PROMPT_TEMPLATE + QUERY_REWRITE_PROMPT
 ├── logger.py              # Structured JSONL logging to agent_logs.jsonl
 ├── app.py                 # Streamlit UI (Chat / Logs / Benchmarks)
 ├── cleanup_modal.sh       # Stop Modal app + delete cached volumes
 ├── deploy/
-│   └── qwen_modal.py      # Modal deployment: Qwen2.5-7B via vLLM (OpenAI-compatible)
+│   └── qwen_modal.py      # Modal deployment: vLLM (LLM) + sentence-transformers (embeddings)
 ├── eval/
 │   ├── test_queries.py    # Correctness test suite (keyword match / anti-match)
 │   ├── compare.py         # AST vs naive benchmark (LLM as judge)

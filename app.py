@@ -47,35 +47,50 @@ with st.sidebar:
                 r = httpx.post(
                     f"{server_url}/api/ingest",
                     json={"repo": repo_input, "mode": mode},
-                    timeout=5.0,
+                    timeout=10.0,
                 )
                 r.raise_for_status()
                 st.success(
                     f"Ingest triggered for **{repo_input}** ({mode}). "
-                    f"Monitor progress in Inngest Dev UI → [localhost:8288](http://localhost:8288)"
+                    f"Monitor progress → [Inngest Dev UI](http://localhost:8288)"
                 )
             except httpx.ConnectError:
                 st.error(
                     "Cannot reach repomind server. Start it first:\n\n"
-                    "`uvicorn server:app --reload --port 8000`"
+                    "`uvicorn server:app --port 8000`"
+                )
+            except httpx.TimeoutException:
+                st.error(
+                    "Server did not respond in time. "
+                    "Check that `uvicorn server:app --port 8000` is running."
                 )
             except httpx.HTTPStatusError as e:
-                st.error(f"Server error: {e.response.text}")
+                st.error(f"Ingest failed ({e.response.status_code}): {e.response.text[:200]}")
+            except Exception as e:
+                st.error(f"Unexpected error triggering ingest: {type(e).__name__}")
 
     st.divider()
 
-    client = chromadb.PersistentClient(path="./chroma_db")
-    collections = [c.name for c in client.list_collections()]
+    try:
+        client = chromadb.PersistentClient(path="./chroma_db")
+        collections = [c.name for c in client.list_collections()]
+    except Exception:
+        collections = []
+        st.warning("Could not load ChromaDB collections.")
 
     if collections:
         selected = st.selectbox("Select indexed repo", collections)
-        st.caption(f"{client.get_collection(selected).count()} chunks")
+        try:
+            chunk_count = client.get_collection(selected).count()
+            st.caption(f"{chunk_count} chunks")
+        except Exception:
+            st.caption("chunk count unavailable")
     else:
         selected = None
         st.caption("No repos ingested yet")
 
     st.divider()
-    st.caption("💡 Uses Claude API — monitor costs in the Logs tab")
+    st.caption("💡 Uses Qwen2.5-7B on Modal — monitor runs in the Logs tab")
 
 # ───────────────────────────────── Tabs ─────────────────────────────────────
 tab_chat, tab_logs, tab_eval = st.tabs(["💬 Chat", "📜 Logs", "📊 Benchmarks"])
@@ -93,7 +108,7 @@ with tab_chat:
                 st.markdown(msg["content"])
                 if msg.get("steps"):
                     with st.expander(f"Agent reasoning ({msg['steps']} steps)"):
-                        for log in msg["logs"]:
+                        for log in msg.get("logs", []):
                             st.json(log, expanded=False)
 
         if prompt := st.chat_input("Ask about the codebase..."):
@@ -103,40 +118,64 @@ with tab_chat:
 
             with st.chat_message("assistant"):
                 with st.spinner("Agent working..."):
-                    result = run_agent(prompt, selected)
-                    session_logs = get_session_logs(result["session_id"])
-                    st.markdown(result["answer"])
-                    with st.expander(f"Agent reasoning ({result['steps']} steps)"):
-                        for log in session_logs:
-                            st.json(log, expanded=False)
-
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": result["answer"],
-                "steps": result["steps"],
-                "logs": session_logs,
-            })
+                    try:
+                        result = run_agent(prompt, selected)
+                        session_logs = get_session_logs(result["session_id"])
+                        st.markdown(result["answer"])
+                        with st.expander(f"Agent reasoning ({result['steps']} steps)"):
+                            for log in session_logs:
+                                st.json(log, expanded=False)
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": result["answer"],
+                            "steps": result["steps"],
+                            "logs": session_logs,
+                        })
+                    except httpx.TimeoutException:
+                        msg = "The LLM took too long to respond. The Modal service may be cold-starting — try again in a moment."
+                        st.warning(msg)
+                        st.session_state.messages.append({"role": "assistant", "content": msg})
+                    except httpx.ConnectError:
+                        msg = "Could not reach the LLM service. Check that `QWEN_GENERATE_URL` is set correctly in `.env`."
+                        st.error(msg)
+                        st.session_state.messages.append({"role": "assistant", "content": msg})
+                    except httpx.HTTPStatusError as e:
+                        msg = f"LLM service returned an error ({e.response.status_code}). Check the Modal deployment."
+                        st.error(msg)
+                        st.session_state.messages.append({"role": "assistant", "content": msg})
+                    except Exception as e:
+                        msg = f"Something went wrong while running the agent. Please try again."
+                        st.error(msg)
+                        st.session_state.messages.append({"role": "assistant", "content": msg})
 
 # ─── Tab 2: Logs ────────────────────────────────────────────────────────────
 with tab_logs:
     st.subheader("Recent agent activity")
 
-    metrics = compute_aggregate_metrics()
-    if metrics:
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total sessions", metrics["total_sessions"])
-        c2.metric("Avg latency", f"{metrics['avg_latency_s']}s")
-        c3.metric("Avg steps", metrics["avg_steps"])
-        total_tokens = (
-            metrics.get("total_input_tokens", 0)
-            + metrics.get("total_output_tokens", 0)
-        )
-        c4.metric("Total tokens", f"{total_tokens:,}")
-        c5.metric("Total cost", f"${metrics.get('total_cost_usd', 0):.3f}")
+    try:
+        metrics = compute_aggregate_metrics()
+        if metrics:
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Total sessions", metrics["total_sessions"])
+            c2.metric("Avg latency", f"{metrics['avg_latency_s']}s")
+            c3.metric("Avg steps", metrics["avg_steps"])
+            total_tokens = (
+                metrics.get("total_input_tokens", 0)
+                + metrics.get("total_output_tokens", 0)
+            )
+            c4.metric("Total tokens", f"{total_tokens:,}")
+            c5.metric("Total cost", f"${metrics.get('total_cost_usd', 0):.3f}")
+    except Exception:
+        st.caption("Metrics unavailable")
 
     st.divider()
 
-    logs = get_recent_logs(50)
+    try:
+        logs = get_recent_logs(50)
+    except Exception:
+        logs = []
+        st.caption("Could not load logs")
+
     if logs:
         icons = {
             "tool_call": "🔧",
@@ -144,6 +183,8 @@ with tab_logs:
             "final_answer": "✅",
             "query_rewrite": "✏️",
             "error": "❌",
+            "llm_error": "❌",
+            "tool_error": "❌",
             "refusal": "🚫",
             "unexpected_stop": "⚠️",
             "max_steps_reached": "⏱️",
@@ -163,17 +204,18 @@ with tab_eval:
     st.subheader("AST vs naive benchmark")
 
     if Path("benchmark_results.json").exists():
-        data = json.loads(Path("benchmark_results.json").read_text())
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("AST wins", f"{data['ast_wins']}/{data['total_queries']}")
-        c2.metric("Avg AST score", data["avg_ast_score"])
-        c3.metric("Avg naive score", data["avg_naive_score"])
-
-        df = pd.DataFrame(data["results"])[
-            ["query", "ast_avg_score", "naive_avg_score", "winner", "delta"]
-        ]
-        st.dataframe(df, use_container_width=True)
+        try:
+            data = json.loads(Path("benchmark_results.json").read_text())
+            c1, c2, c3 = st.columns(3)
+            c1.metric("AST wins", f"{data['ast_wins']}/{data['total_queries']}")
+            c2.metric("Avg AST score", data["avg_ast_score"])
+            c3.metric("Avg naive score", data["avg_naive_score"])
+            df = pd.DataFrame(data["results"])[
+                ["query", "ast_avg_score", "naive_avg_score", "winner", "delta"]
+            ]
+            st.dataframe(df, use_container_width=True)
+        except Exception:
+            st.warning("benchmark_results.json could not be parsed.")
     else:
         st.info("Run: python eval/compare.py owner/repo")
 
@@ -182,12 +224,15 @@ with tab_eval:
 
     eval_path = Path("eval_results.jsonl")
     if eval_path.exists():
-        results = [
-            json.loads(line) for line in eval_path.read_text().splitlines() if line
-        ]
-        passed_count = sum(1 for r in results if r.get("passed"))
-        pass_rate = passed_count / len(results) if results else 0
-        st.metric("Pass rate", f"{pass_rate * 100:.0f}%")
-        st.dataframe(pd.DataFrame(results), use_container_width=True)
+        try:
+            results = [
+                json.loads(line) for line in eval_path.read_text().splitlines() if line
+            ]
+            passed_count = sum(1 for r in results if r.get("passed"))
+            pass_rate = passed_count / len(results) if results else 0
+            st.metric("Pass rate", f"{pass_rate * 100:.0f}%")
+            st.dataframe(pd.DataFrame(results), use_container_width=True)
+        except Exception:
+            st.warning("eval_results.jsonl could not be parsed.")
     else:
         st.info("Run: python eval/test_queries.py <collection>")

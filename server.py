@@ -161,7 +161,42 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
     return result
 
 
-# ─── Inngest function 3: post-run metrics hook ──────────────────────────────
+# ─── Inngest function 3: Streamlit path step checkpoints ────────────────────
+
+@inngest_client.create_function(
+    fn_id="repomind-streamlit-step",
+    trigger=inngest.TriggerEvent(event="repomind/streamlit_step"),
+)
+async def streamlit_step_fn(ctx: inngest.Context) -> dict:
+    """Receives per-stage events fired by the synchronous Streamlit agent path.
+
+    Each stage (query_rewrite, llm_generate, tool_call, final_answer, *_error)
+    fires a separate repomind/streamlit_step event from agent.py. This function
+    runs a single log-step so every stage appears as a separate timed run in
+    the Inngest Dev UI — giving the same per-step visibility as the async path.
+    """
+    data = ctx.event.data
+
+    def _log(d: dict) -> dict:
+        step = d.get("step", "unknown")
+        session = d.get("session_id", "?")[:8]
+        latency = d.get("latency_ms") or d.get("total_latency_ms")
+        if "error" in step:
+            logger.warning(
+                "streamlit step ERROR: session=%s step=%s error=%s",
+                session, step, d.get("error", "?"),
+            )
+        else:
+            logger.info(
+                "streamlit step: session=%s step=%s latency_ms=%s",
+                session, step, latency,
+            )
+        return d
+
+    return await ctx.step.run("log-step", lambda: _log(data))
+
+
+# ─── Inngest function 4: post-run metrics hook ──────────────────────────────
 
 @inngest_client.create_function(
     fn_id="repomind-agent-completed",
@@ -200,8 +235,8 @@ async def agent_completed_fn(ctx: inngest.Context) -> dict:
 
 # ─── FastAPI app ─────────────────────────────────────────────────────────────
 
-app = FastAPI(title="repomind server")
-inngest.fast_api.serve(app, inngest_client, [ingest_repo_fn, run_agent_fn, agent_completed_fn])
+app = FastAPI(title="repomind server")  # 4 Inngest functions registered below
+inngest.fast_api.serve(app, inngest_client, [ingest_repo_fn, run_agent_fn, streamlit_step_fn, agent_completed_fn])
 
 
 class IngestRequest(BaseModel):
