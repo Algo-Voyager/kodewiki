@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { triggerQuery, pollResult, fetchSessionLogs, type AgentResult, type LogEntry } from "@/lib/api";
+import { triggerQuery, pollResult, fetchSessionLogs, type AgentResult, type LogEntry, type ContextMessage } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ReasoningExpander } from "@/components/ReasoningExpander";
@@ -36,6 +36,9 @@ export default function ChatPage() {
   // see current values without needing to be inside a useCallback dep array.
   const inFlightRef = useRef<Record<string, boolean>>({});
   const queuesRef = useRef<Record<string, string[]>>({});
+  // Per-collection compressed context sent to the backend.
+  // Separate from UI messages so compression doesn't affect the chat display.
+  const contextRef = useRef<Record<string, ContextMessage[]>>({});
   // UI-only state for re-renders
   const [loadingCols, setLoadingCols] = useState<Record<string, boolean>>({});
   const [queueCounts, setQueueCounts] = useState<Record<string, number>>({});
@@ -91,10 +94,15 @@ export default function ChatPage() {
   // Core query executor — independent of React render cycle after being called.
   // Uses functional state updaters and refs so there are no stale closure issues.
   async function executeQuery(col: string, prompt: string) {
+    // Snapshot the current compressed context and build the history to send.
+    // contextRef holds only prior exchanges; the new user message is NOT included
+    // here because the backend appends it internally during the ReAct prompt.
+    const historyToSend: ContextMessage[] = contextRef.current[col] ?? [];
+
     appendMessage(col, { role: "assistant", content: "…" });
 
     try {
-      const sessionId = await triggerQuery(prompt, col);
+      const sessionId = await triggerQuery(prompt, col, historyToSend);
 
       let result: AgentResult | null = null;
       for (let i = 0; i < 120; i++) {
@@ -119,6 +127,16 @@ export default function ChatPage() {
         steps: result!.steps,
         logs,
       }));
+
+      // Update the context for the next message.
+      // Use compressed_history returned by backend (may be same as sent if no
+      // compression was needed), then append the current exchange.
+      const updatedContext: ContextMessage[] = [
+        ...(result.compressed_history ?? historyToSend),
+        { role: "user", content: prompt },
+        { role: "assistant", content: result.answer },
+      ];
+      contextRef.current[col] = updatedContext;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Something went wrong. Please try again.";
       updateLastAssistant(col, (m) => ({ ...m, content: msg, error: true }));

@@ -41,11 +41,32 @@ from eval.metrics import compute_aggregate_metrics
 from ingest import embed_and_store_chunks, fetch_and_chunk_repo
 from inngest_setup import inngest_client
 from logger import get_recent_logs, get_session_logs
+from prompts import COMPRESS_HISTORY_PROMPT
 
 logger = logging.getLogger("uvicorn")
 
 # In-memory result cache keyed by event_id (used as session_id in run_agent_fn).
 _RESULT_CACHE: dict[str, dict] = {}
+
+# ─── History compression constants ──────────────────────────────────────────
+_HISTORY_COMPRESS_THRESHOLD = 12_000   # chars — trigger compression above this
+_HISTORY_CHAR_LIMIT = 16_000           # hard cap sent from frontend
+_HISTORY_KEEP_RECENT = 4               # message pairs kept verbatim after compress
+
+
+def _total_history_chars(history: list[dict]) -> int:
+    return sum(len(m.get("content", "")) for m in history)
+
+
+def _format_history_block(history: list[dict]) -> str:
+    """Format history as 'User: ...\nAssistant: ...' text for LLM consumption."""
+    lines = []
+    for m in history:
+        role = "User" if m.get("role") == "user" else "Assistant"
+        content = m.get("content", "").strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)
 
 
 # ─── Inngest function 1: ingest repo ────────────────────────────────────────
@@ -145,7 +166,52 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
     # caller can poll /api/result/{session_id} without depending on Inngest's
     # internal event ID format.
     session_id: str = ctx.event.data.get("session_id") or ctx.event.id
+    history: list[dict] = ctx.event.data.get("history", [])
     run_start = time.time()
+
+    # Step: compress-history — always runs so Inngest replay order is stable.
+    # Only makes an LLM call when total history chars exceed the threshold.
+    async def _compress_history() -> dict:
+        import asyncio as _aio
+        total = _total_history_chars(history)
+        if total <= _HISTORY_COMPRESS_THRESHOLD or not history:
+            return {"history": history, "compressed": False, "total_chars": total}
+
+        # Keep the last KEEP_RECENT pairs verbatim, summarise everything older.
+        keep = _HISTORY_KEEP_RECENT * 2
+        recent = history[-keep:]
+        old = history[:-keep]
+        if not old:
+            return {"history": history, "compressed": False, "total_chars": total}
+
+        old_text = _format_history_block(old)
+        summary = await _aio.to_thread(
+            _generate,
+            COMPRESS_HISTORY_PROMPT.format(history_text=old_text),
+            200,
+            0.1,
+        )
+        compressed = [
+            {"role": "assistant", "content": f"[Summary of earlier conversation]: {summary.strip()}"}
+        ] + recent
+        log_step(session_id, 0, "history_compressed", {
+            "original_chars": total,
+            "compressed_chars": _total_history_chars(compressed),
+            "messages_removed": len(old),
+        })
+        return {"history": compressed, "compressed": True, "total_chars": _total_history_chars(compressed)}
+
+    compress_result: dict = await ctx.step.run("compress-history", _compress_history)
+    effective_history: list[dict] = compress_result["history"]
+
+    # Build the history block injected into the ReAct prompt and the rewrite prompt.
+    history_text = _format_history_block(effective_history)
+    history_block = (
+        f"\nConversation history:\n{history_text}\n"
+        if history_text else ""
+    )
+    # Use only the last 4 messages for the rewrite context (sufficient for reference resolution).
+    rewrite_context = _format_history_block(effective_history[-4:]) if effective_history else ""
 
     # Step: query-rewrite — async so the blocking httpx.post doesn't freeze the
     # event loop; log_step runs inside so it only fires once (not on replays).
@@ -153,7 +219,7 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
         import asyncio as _aio
         import time as _t
         t = _t.time()
-        result = await _aio.to_thread(query_rewrite, query)
+        result = await _aio.to_thread(query_rewrite, query, rewrite_context)
         log_step(session_id, 0, "query_rewrite", {
             "original": query,
             "rewritten": result,
@@ -175,6 +241,7 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
             question=query,
             rewritten=rewritten,
             scratchpad=scratchpad,
+            history_block=history_block,
         )
 
         # Step: llm-generate-N — async to avoid blocking the event loop
@@ -302,6 +369,9 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
         "total_latency_s": total_latency_s,
         "embed_ms": total_embed_ms or None,
         "chroma_ms": total_chroma_ms or None,
+        # Return the (possibly compressed) history so the frontend can use it
+        # as the context base for the next message in this conversation.
+        "compressed_history": effective_history,
     }
     _RESULT_CACHE[session_id] = result
     return result
@@ -321,6 +391,7 @@ class IngestRequest(BaseModel):
 class QueryRequest(BaseModel):
     query: str
     collection_name: str
+    history: list[dict] = []
 
 
 @app.post("/api/ingest")
@@ -348,6 +419,7 @@ async def trigger_query(req: QueryRequest):
                 "query": req.query,
                 "collection_name": req.collection_name,
                 "session_id": session_id,
+                "history": req.history,
             },
         )
     )

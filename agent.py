@@ -26,7 +26,7 @@ import httpx
 from dotenv import load_dotenv
 
 from logger import log_step
-from prompts import QUERY_REWRITE_PROMPT, REACT_PROMPT_TEMPLATE
+from prompts import COMPRESS_HISTORY_PROMPT, QUERY_REWRITE_PROMPT, REACT_PROMPT_TEMPLATE
 from tools import _TOOL_METRICS, run_tool
 
 load_dotenv()
@@ -49,10 +49,14 @@ def _generate(prompt: str, max_new_tokens: int = 512, temperature: float = 0.2) 
     return resp.json()["response"].strip()
 
 
-def query_rewrite(user_query: str) -> str:
+def query_rewrite(user_query: str, history_context: str = "") -> str:
     """Rewrite a user question into a compact semantic-search query."""
+    history_block = (
+        f"\nConversation context (resolve any references like 'it', 'that', 'the above'):\n{history_context}\n"
+        if history_context.strip() else ""
+    )
     return _generate(
-        QUERY_REWRITE_PROMPT.format(query=user_query),
+        QUERY_REWRITE_PROMPT.format(query=user_query, history_context=history_block),
         max_new_tokens=100,
         temperature=0.1,
     )
@@ -105,6 +109,7 @@ def run_agent(
             question=user_query,
             rewritten=rewritten,
             scratchpad=scratchpad,
+            history_block="",
         )
 
         t0 = time.time()

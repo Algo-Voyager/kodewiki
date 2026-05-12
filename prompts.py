@@ -34,7 +34,8 @@ Rules:
 - Always start with vector_search.
 - Ground every claim in retrieved content — cite file paths and line numbers.
 - Do NOT hallucinate. If you cannot find the answer after searching, say so clearly.
-
+- Use conversation history (if provided) to understand pronouns and follow-up references.
+{history_block}
 Question: {question}
 Search query (pre-optimised for semantic search): {rewritten}
 
@@ -44,8 +45,9 @@ Search query (pre-optimised for semantic search): {rewritten}
 QUERY_REWRITE_PROMPT = """\
 Rewrite the user's question into a concise search query optimized
 for semantic code search. Extract key technical terms. Remove
-filler words.
-
+filler words. If the question contains references like "it", "that",
+"the above", or "those" resolve them using the conversation history.
+{history_context}
 Examples:
 User: "how do I log in to this app?"
 Rewrite: "authentication login flow implementation"
@@ -56,3 +58,12 @@ Rewrite: "UserService class definition methods"
 User: "{query}"
 Rewrite:
 """
+
+
+COMPRESS_HISTORY_PROMPT = """\
+Summarize the following conversation between a user and a codebase assistant.
+Preserve all technical details: file names, function names, class names, module names,
+error messages, architectural decisions, and key findings.
+Be concise — target 100-150 words. Output only the summary, no preamble.
+
+{history_text}"""

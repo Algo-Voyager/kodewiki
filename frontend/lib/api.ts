@@ -23,6 +23,11 @@ export interface Metrics {
   total_cost_usd?: number;
 }
 
+export interface ContextMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export interface AgentResult {
   session_id: string;
   answer: string;
@@ -31,6 +36,7 @@ export interface AgentResult {
   total_latency_s: number;
   embed_ms: number | null;
   chroma_ms: number | null;
+  compressed_history: ContextMessage[];
 }
 
 export async function fetchCollections(): Promise<Collection[]> {
@@ -54,12 +60,13 @@ export async function ingestRepo(repo: string, mode: string): Promise<void> {
 
 export async function triggerQuery(
   query: string,
-  collection_name: string
+  collection_name: string,
+  history: ContextMessage[] = []
 ): Promise<string> {
   const res = await fetch(`${BASE}/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, collection_name }),
+    body: JSON.stringify({ query, collection_name, history }),
   });
   if (!res.ok) throw new Error(`Query trigger failed (${res.status})`);
   const data = await res.json();
