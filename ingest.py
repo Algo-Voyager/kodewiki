@@ -40,7 +40,7 @@ ALLOWED_EXTS = {
 }
 MAX_FILE_BYTES = 500 * 1024
 CHUNK_CHARS = 2000
-CHUNK_OVERLAP = 50
+CHUNK_OVERLAP = 200
 
 EXT_LANGUAGE = {
     ".py":    "python",
@@ -86,22 +86,58 @@ def should_skip_path(path: str) -> bool:
     return any(p in SKIP_DIRS for p in parts)
 
 
-def _sub_chunk(text: str, base_id: str, base_meta: dict) -> list[Chunk]:
-    """Split oversized text into overlapping character windows (same logic as naive_chunk)."""
-    step = CHUNK_CHARS - CHUNK_OVERLAP
-    chunks = []
+def _sub_chunk(text: str, base_id: str, base_meta: dict, header: str = "") -> list[Chunk]:
+    """Split an oversized AST node into parts, prepending the function/class header
+    to every continuation part so each chunk is self-contained.
+
+    `header` must be passed in by the caller (computed from AST line info) —
+    we do not re-parse it here to avoid bugs with decorators and multi-line signatures.
+    No overlap is used — the header provides the context for each continuation part.
+    """
+    all_lines = text.splitlines(keepends=True)
+    chunks: list[Chunk] = []
     part = 0
-    i = 0
-    while i < len(text):
-        window = text[i : i + CHUNK_CHARS]
-        if window.strip():
-            chunks.append(Chunk(
-                chunk_id=f"{base_id}::part{part}",
-                text=window,
-                metadata={**base_meta, "part": part},
-            ))
-            part += 1
-        i += step
+
+    # part0: as much of the function as fits from the beginning
+    window_lines: list[str] = []
+    char_count = 0
+    for line in all_lines:
+        if char_count + len(line) > CHUNK_CHARS and window_lines:
+            break
+        window_lines.append(line)
+        char_count += len(line)
+
+    chunks.append(Chunk(
+        chunk_id=f"{base_id}::part0",
+        text="".join(window_lines),
+        metadata={**base_meta, "part": 0},
+    ))
+    start_idx = len(window_lines)
+    part = 1
+
+    # continuation parts: prepend header so each chunk is self-contained
+    while start_idx < len(all_lines):
+        window_lines = []
+        char_count = len(header)
+        for line in all_lines[start_idx:]:
+            if char_count + len(line) > CHUNK_CHARS and window_lines:
+                break
+            window_lines.append(line)
+            char_count += len(line)
+
+        if not window_lines:
+            start_idx += 1
+            continue
+
+        window = header + "    # ... continued ...\n" + "".join(window_lines)
+        chunks.append(Chunk(
+            chunk_id=f"{base_id}::part{part}",
+            text=window,
+            metadata={**base_meta, "part": part},
+        ))
+        part += 1
+        start_idx += len(window_lines)
+
     return chunks
 
 
@@ -127,7 +163,22 @@ def _ast_function_chunks(
     }
     if len(text) <= CHUNK_CHARS:
         return [Chunk(chunk_id=base_id, text=text, metadata=base_meta)]
-    return _sub_chunk(text, base_id, base_meta)
+
+    # Compute header: decorators + signature + docstring (if present).
+    # Using AST line info avoids re-parsing decorated/multi-line signatures.
+    if node.body:
+        first_stmt = node.body[0]
+        if (isinstance(first_stmt, ast.Expr) and
+                isinstance(first_stmt.value, ast.Constant)):
+            # Docstring is first statement — include it in the header
+            header_end = first_stmt.end_lineno or first_stmt.lineno
+        else:
+            header_end = first_stmt.lineno - 1
+        header = "\n".join(lines[node.lineno - 1 : header_end]) + "\n"
+    else:
+        header = lines[node.lineno - 1] + "\n"
+
+    return _sub_chunk(text, base_id, base_meta, header=header)
 
 
 def _ast_class_header_chunk(node: ast.ClassDef, lines: list[str], file_path: str) -> Chunk:

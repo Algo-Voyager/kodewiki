@@ -50,6 +50,10 @@ Rules:
     flowchart TD      → step-by-step flows, pipelines, data paths
     sequenceDiagram   → request/response or call flows between components
     classDiagram      → class structures and relationships
+  classDiagram rules (STRICT — violations cause a parse error):
+    - NEVER use curly braces inside member lines. Write +method() not +method({key})
+    - Omit parameter types: write +build(context) not +build(BuildContext context)
+    - List at most 5 members per class to keep the diagram readable
   After the diagram, add a short text explanation of the key steps.
 {history_block}
 Question: {question}

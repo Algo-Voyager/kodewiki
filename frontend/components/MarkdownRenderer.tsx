@@ -9,6 +9,26 @@ import type { Components } from "react-markdown";
 const BTN =
   "flex items-center justify-center rounded-md bg-muted border border-border text-foreground hover:bg-accent transition-colors text-sm select-none";
 
+// Mermaid classDiagram rejects {} inside member lines (e.g. {super.key} in Dart/Flutter).
+// Strip curly-brace content from member definitions before rendering.
+function sanitizeMermaid(code: string): string {
+  if (!code.trimStart().startsWith("classDiagram")) return code;
+  return code
+    .split("\n")
+    .map((line) => {
+      const t = line.trimStart();
+      // Member lines start with a visibility modifier
+      if (/^[+\-#~]/.test(t)) {
+        return line
+          .replace(/\{[^}]*\}/g, "")   // remove {super.key}, {required}, etc.
+          .replace(/\s+\)/g, ")")       // clean up trailing spaces before )
+          .trimEnd();
+      }
+      return line;
+    })
+    .join("\n");
+}
+
 function MermaidBlock({ code }: { code: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [svgContent, setSvgContent] = useState("");
@@ -39,7 +59,7 @@ function MermaidBlock({ code }: { code: string }) {
       });
       const id = `mermaid-${Math.random().toString(36).slice(2)}`;
       mermaid
-        .render(id, code)
+        .render(id, sanitizeMermaid(code))
         .then(({ svg }) => {
           if (cancelled || !ref.current) return;
           ref.current.innerHTML = svg;

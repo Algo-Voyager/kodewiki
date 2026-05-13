@@ -154,8 +154,10 @@ Step 2 — top-level scan  (ast.iter_child_nodes(tree))
        │    Step 3b — size check                                    │
        │      len(text) <= 2000 chars?                              │
        │        YES → one Chunk                                     │
-       │        NO  → sub-chunk with 2000-char sliding window       │
-       │              each part gets chunk_id …::part0, ::part1 …  │
+       │        NO  → sub-chunk at line boundaries:                 │
+       │              part0 = first 2000 chars (full header+body)   │
+       │              part1+ = function header prepended + body     │
+       │              each part: chunk_id …::part0, ::part1 …      │
        │                                                             ◄──┘
        │
        └─ ClassDef  ────────────────────────────────────────────────┐
@@ -440,21 +442,71 @@ The backend receives `history[]` per-request, optionally compresses it, and retu
 
 ## Challenges & lessons learned
 
-Ordered by depth of insight.
-
-### 1. Inngest sync handlers block the asyncio event loop
-
-**Problem:** The frontend poll returned 500 even though Inngest Dev UI showed the function completing.
-
-**Root cause:** The Inngest Python SDK's `step_async.py` calls handlers via `maybe_await(handler(*args))` directly on the event loop. A blocking sync handler (httpx, chromadb) holds the thread, starving uvicorn.
-
-**Fix:** All step handlers converted to `async def`. Every blocking call wrapped with `asyncio.to_thread(fn, ...)`.
-
-**Lesson:** Inngest doesn't warn you. Any sync I/O in an async handler is a silent blocker.
+Ordered by depth of technical insight — core design decisions and retrieval quality issues first, infrastructure and UI issues last.
 
 ---
 
-### 2. `ast.walk` caused method bodies to appear twice
+### 1. Sub-chunk overlap was the wrong concept for AST
+
+**Problem:** When a function exceeded 2000 chars, `_sub_chunk` split it using the same overlapping sliding window used for naive chunking. Part1 started mid-function with zero context:
+
+```python
+# part0 — has signature and first half
+def authenticate(self, user, password):
+    """Validate credentials"""
+    if not user:
+        ...
+
+# part1 — starts mid-function, no context
+        token = generate_token()
+        return token
+```
+
+The LLM sees part1 and has no idea which function it's in, what it does, or what came before.
+
+**Why overlap is wrong for AST:** Overlap is designed for naive chunking where chunks are arbitrary cuts of continuous text — you repeat a few chars so neither side loses context at the cut point. For AST sub-chunks the context is not at the character boundary — it's the function signature and docstring at the top of the function. Overlapping random body lines doesn't help.
+
+**Fix:** Every continuation part now prepends the function header (decorators + signature + docstring), computed from AST line info:
+
+```python
+# part0 — starts normally
+def authenticate(self, user, password):
+    """Validate credentials"""
+    if not user:
+        ...
+
+# part1 — header prepended, self-contained
+def authenticate(self, user, password):   # <- prepended
+    """Validate credentials"""            # <- prepended
+    # ... continued ...
+        token = generate_token()
+        return token
+```
+
+Header is extracted using `node.lineno` (first decorator or `def` line) through `first_stmt.end_lineno` (last line of docstring, if present). This correctly handles decorated functions and multi-line signatures without re-parsing the text.
+
+The trade-off: the header costs ~200 chars per continuation part, leaving ~1800 chars of body instead of 2000. That's acceptable — unreadable fragments are far worse.
+
+---
+
+### 2. Vector search retrieved only some parts of a split function
+
+**Problem:** When a large function is split into part0, part1, part2, `vector_search` returns top-N chunks by similarity score. It might return part2 (score 0.4) and skip part0 and part1 entirely — the LLM sees the middle of a function with no signature, no docstring, no beginning.
+
+The header-prepend fix (challenge 1) partially helped — at least every part has the function name. But the body is still incomplete: the LLM sees part2's content without knowing what part0 set up.
+
+**Fix — sibling-part expansion in `vector_search`:** After retrieving top-N chunks, check if any result has `part` in its metadata. If so, query ChromaDB for all chunks sharing the same `type + name + file_path + line_start` and merge them into the result. The LLM receives all parts of the function in order, not just the one that scored highest.
+
+```
+Before: query returns part2 only  (scored 0.4)
+After:  query returns part0 + part1 + part2  (+2 sibling parts)
+```
+
+The result header shows `Found 5 results (+2 sibling parts)` so the LLM knows the expansion happened. Sibling fetch is best-effort — a failure doesn't break the query.
+
+---
+
+### 3. `ast.walk` caused method bodies to appear twice
 
 **Problem:** The original AST implementation used `ast.walk(tree)` — a flat traversal that visits every node at every depth. A class with 3 methods produced 4 chunks, but each method's code appeared in *both* the class chunk (full class body) and the method's own chunk.
 
@@ -466,15 +518,77 @@ Ordered by depth of insight.
 
 ---
 
-### 3. Oversized functions broke embedding quality
+### 4. Why AST chunking only works for Python
 
-**Problem:** A 400-line function became one 6 000-char chunk. Embedding models compress long text poorly — the vector loses specificity and retrieval quality drops.
+**Question:** Why does AST mode produce `function`/`class` chunks for Python repos but not for Dart/Flutter repos?
 
-**Fix:** After extracting a function or method, if `len(text) > 2000`, apply the same sliding-window as naive chunking on the function text. Each part gets `::part0`, `::part1` etc. in the chunk ID. The `part` index is stored in metadata. When `vector_search` returns a sub-chunk it labels it `[excerpt part N]` and surfaces the docstring so the LLM can assess whether it needs the full file.
+**Answer:** Python ships a built-in `ast` module in the standard library — one import, zero extra dependencies, gives a full syntax tree with exact line numbers for every function and class. Dart has no equivalent accessible from Python. Parsing Dart properly requires either `tree-sitter` (a C library with Python bindings, adds a native dependency) or regex heuristics (fragile, not a real parser). So the code does:
+
+```python
+if ext == ".py" and mode == "ast":
+    chunks = extract_python_ast_chunks(content, path)
+# everything else -> naive sliding window
+```
+
+For non-Python repos (Dart, Go, TS, etc.) both AST and naive mode produce identical chunks. The benchmark will always tie on those repos — the difference only shows up on Python codebases.
+
+**How DeepWiki and similar tools solve this:** They use `tree-sitter`, which supports 40+ languages with a single consistent API. Each language has a `.so` grammar file; one Python call gives an AST for any of them. The cost is a native C dependency and ~50 MB of grammar files.
 
 ---
 
-### 4. AST metadata was stored but never shown to the LLM
+### 5. Oversized functions broke embedding quality
+
+**Problem:** A 400-line function became one 6 000-char chunk. Embedding models compress long text poorly — the vector loses specificity and retrieval quality drops.
+
+**Fix:** After extracting a function or method, if `len(text) > 2000`, split at line boundaries into parts (`::part0`, `::part1`, etc.). The `part` index is stored in metadata. When `vector_search` returns a sub-chunk it labels it `[excerpt part N]` and surfaces the docstring so the LLM can assess whether it needs the full file.
+
+---
+
+### 6. Chunking parameters: window, overlap, and how they differ between AST and naive
+
+```
+CHUNK_CHARS   = 2000   # max characters per chunk
+CHUNK_OVERLAP = 200    # characters of overlap
+```
+
+**Naive sliding window** uses both constants:
+- Window: 2000 chars
+- Step: 1800 chars (CHUNK_CHARS - CHUNK_OVERLAP)
+- Overlap: 200 chars — the last 200 chars of chunk N reappear as the first 200 chars of chunk N+1
+- Cuts raw characters; no awareness of line or statement boundaries
+
+**AST sub-chunking ignores CHUNK_OVERLAP entirely:**
+- Part 0: function start up to 2000 chars, stops at a line boundary
+- Part 1+: `header + "# ... continued ..." + next (2000 - len(header)) chars of body`
+- No overlap; the header provides context instead
+
+| | Naive | AST sub-chunks |
+|---|---|---|
+| Window | 2000 chars | 2000 chars |
+| Step | 1800 chars (uses CHUNK_OVERLAP) | variable (lines consumed) |
+| Overlap | 200 chars of raw text | none |
+| Context strategy | trailing chars from previous chunk | header prepend per continuation part |
+| Boundary aware | no (character) | yes (line) |
+
+`CHUNK_OVERLAP` is defined at module level but only read by `naive_chunk`. All AST sub-chunk logic ignores it.
+
+---
+
+### 7. End-to-end correctness of AST chunking
+
+After tracing through all four functions in the call chain:
+
+**`extract_python_ast_chunks`** — uses `ast.iter_child_nodes` (not `ast.walk`), so nested functions inside methods are not double-counted. Top-level functions and class methods each go through `_ast_function_chunks`. Class headers go through `_ast_class_header_chunk`. Correct.
+
+**`_ast_function_chunks`** — extracts `text` using `lines[node.lineno-1 : node.end_lineno]`. For small functions (<=2000 chars), returns a single chunk. For large ones, computes the header from AST line info (handles decorators and multi-line signatures correctly) and passes it to `_sub_chunk`. Correct after the header-passing fix.
+
+**`_ast_class_header_chunk`** — finds `first_method_lineno` via `iter_child_nodes`, slices text to just before it. Strips trailing blank lines. Result: class signature + docstring + class-level variables only, no method bodies. Correct. One known gap: if the class header itself exceeds 2000 chars it is not sub-chunked — non-issue in practice since class headers are almost never that long.
+
+**`_sub_chunk`** — part 0 fills up to 2000 chars stopping at a line boundary. Continuation parts start `char_count` at `len(header)` so body content per part is `2000 - len(header)` chars. `start_idx` advances by `len(window_lines)` (lines consumed, not characters). Safety valve: if a single line exceeds 2000 chars the `window_lines` empty-check prevents an infinite loop. Correct.
+
+---
+
+### 8. AST metadata was stored but never shown to the LLM
 
 **Problem:** `name`, `line_start`, `line_end`, `docstring` were all stored in ChromaDB metadata but `vector_search` only returned the raw chunk text. The metadata existed but the LLM never saw it.
 
@@ -486,7 +600,7 @@ Sub-chunks also show `[excerpt part N]` and the docstring. The ReAct prompt tell
 
 ---
 
-### 5. Conversation history required a stateless compression contract
+### 9. Conversation history required a stateless compression contract
 
 **Problem:** The backend is stateless per-request. Passing full history every turn causes context bloat at 16 K+ chars.
 
@@ -494,7 +608,19 @@ Sub-chunks also show `[excerpt part N]` and the docstring. The ReAct prompt tell
 
 ---
 
-### 6. Benchmark used the wrong embedding backend
+### 10. Inngest sync handlers block the asyncio event loop
+
+**Problem:** The frontend poll returned 500 even though Inngest Dev UI showed the function completing.
+
+**Root cause:** The Inngest Python SDK's `step_async.py` calls handlers via `maybe_await(handler(*args))` directly on the event loop. A blocking sync handler (httpx, chromadb) holds the thread, starving uvicorn.
+
+**Fix:** All step handlers converted to `async def`. Every blocking call wrapped with `asyncio.to_thread(fn, ...)`.
+
+**Lesson:** Inngest doesn't warn you. Any sync I/O in an async handler is a silent blocker.
+
+---
+
+### 11. Benchmark used the wrong embedding backend
 
 **Problem:** `eval/compare.py` called `ollama.embeddings()` while the rest of the project had moved to Modal. Benchmark retrieval was in a completely different vector space from the indexed collections — results were meaningless.
 
@@ -502,7 +628,23 @@ Sub-chunks also show `[excerpt part N]` and the docstring. The ReAct prompt tell
 
 ---
 
-### 7. Per-collection message queuing
+### 12. Tiny tail fragments from line-boundary sub-chunking
+
+**Problem:** After switching `_sub_chunk` to line-boundary windowing, the tail of large functions produced useless micro-chunks:
+
+```
+part3  ->  131 chars  ("retry_delay=...  log_level=...  )")
+part4  ->   70 chars  ("log_level=...  )")
+part5  ->    9 chars  ("        )")   <- just a closing paren
+```
+
+**Root cause:** With short tail lines (~50 chars each), the overlap logic backed up by 1 line per iteration — advancing `start_idx` by only 1 line at a time through the last few lines, creating a new chunk for each.
+
+**Fix:** Skip any chunk after the first whose stripped content is shorter than `CHUNK_OVERLAP` chars — it's already fully covered by the previous chunk's window and adds no new information.
+
+---
+
+### 13. Per-collection message queuing
 
 **Problem:** Sending a second question before the first finishes produces incoherent compressed history.
 
@@ -510,7 +652,7 @@ Sub-chunks also show `[excerpt part N]` and the docstring. The ReAct prompt tell
 
 ---
 
-### 8. Sidebar drag required document-level mouse listeners
+### 14. Sidebar drag required document-level mouse listeners
 
 **Problem:** Fast mouse movement escaped the 4 px drag handle, breaking the gesture.
 
@@ -518,7 +660,7 @@ Sub-chunks also show `[excerpt part N]` and the docstring. The ReAct prompt tell
 
 ---
 
-### 9. Sidebar scroll required `min-h-0` on the flex child
+### 15. Sidebar scroll required `min-h-0` on the flex child
 
 **Problem:** `overflow-y-auto` on the collections list had no effect.
 

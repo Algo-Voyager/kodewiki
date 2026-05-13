@@ -106,8 +106,49 @@ def vector_search(
     if not ids:
         return f"No results for query {query!r}."
 
-    lines = [f"Found {len(ids)} results:", ""]
-    for i, (doc, meta) in enumerate(zip(docs, metas), start=1):
+    # --- sibling-part expansion -------------------------------------------
+    # If any result is a sub-chunk (has a "part" metadata field), fetch ALL
+    # sibling parts of that function so the LLM sees the complete body.
+    # We identify siblings by the shared base_id (chunk_id without ::partN).
+    seen_ids = set(ids)
+    extra_docs: list[str] = []
+    extra_metas: list[dict] = []
+
+    for chunk_id, meta in zip(ids, metas):
+        if meta and meta.get("part") is not None:
+            # base_id is everything before ::partN
+            base_id = chunk_id.rsplit("::part", 1)[0]
+            # Fetch all chunks whose id starts with base_id
+            try:
+                siblings = collection.get(
+                    where={"$and": [
+                        {"type":      {"$eq": meta["type"]}},
+                        {"name":      {"$eq": meta["name"]}},
+                        {"file_path": {"$eq": meta["file_path"]}},
+                        {"line_start":{"$eq": meta["line_start"]}},
+                    ]},
+                    include=["documents", "metadatas"],
+                )
+                for sib_id, sib_doc, sib_meta in zip(
+                    siblings["ids"], siblings["documents"], siblings["metadatas"]
+                ):
+                    if sib_id not in seen_ids:
+                        seen_ids.add(sib_id)
+                        extra_docs.append(sib_doc)
+                        extra_metas.append(sib_meta or {})
+            except Exception:
+                pass  # sibling fetch is best-effort
+
+    # Merge: original results first, then any newly fetched siblings
+    all_docs   = docs   + extra_docs
+    all_metas  = metas  + extra_metas
+    # ----------------------------------------------------------------------
+
+    total = len(ids) + len(extra_docs)
+    sibling_note = f" (+{len(extra_docs)} sibling parts)" if extra_docs else ""
+    lines = [f"Found {len(ids)} results{sibling_note}:", ""]
+
+    for i, (doc, meta) in enumerate(zip(all_docs, all_metas), start=1):
         meta = meta or {}
         kind = meta.get("type", "chunk")
         file_path = meta.get("file_path", "?")
@@ -115,17 +156,15 @@ def vector_search(
         line_start = meta.get("line_start")
         line_end = meta.get("line_end")
         heading = meta.get("heading")
-        part = meta.get("part")          # set only on sub-chunks of oversized nodes
+        part = meta.get("part")
         docstring = meta.get("docstring", "")
 
         if kind in ("function", "class") and name and line_start and line_end:
-            part_note = f" [excerpt part {part}]" if part is not None else ""
+            part_note = f" [part {part}]" if part is not None else ""
             header = (
                 f"[{i}] {kind} `{name}` in {file_path} "
                 f"(lines {line_start}-{line_end}){part_note}"
             )
-            # Surface the docstring in the header so the LLM understands the
-            # function's purpose even when it receives a mid-body sub-chunk.
             if docstring and part:
                 header += f"\n    Docstring: {docstring[:200]}"
         elif kind == "doc" and heading:
