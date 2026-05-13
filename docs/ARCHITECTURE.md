@@ -78,7 +78,9 @@ You give it a GitHub repo and a question. It finds the relevant code through a s
 | `frontend/app/chat/page.tsx` | Chat UI. Per-collection queue. `contextRef` for compressed history. Framer-motion animations. |
 | `frontend/components/Sidebar.tsx` | Resizable sidebar (160–400 px). Ingest form, AST/naive toggle, indexed repos list. |
 | `frontend/lib/api.ts` | `triggerQuery`, `pollResult`, `fetchCollections`, `ingestRepo`. |
-| `eval/compare.py` | AST vs naive benchmark. Retrieves top-3 chunks per query, asks Qwen to score 1–5. Writes `frontend/public/benchmark_results.json`. |
+| `eval/compare.py` | AST vs naive benchmark (8 general queries). Retrieves top-3 chunks per query, asks Qwen to score 1–5. Writes `frontend/public/benchmark_results.json`. |
+| `eval/compare1.py` | Python-targeted benchmark (10 queries designed to expose AST advantages: function boundaries, class headers, docstrings, retry logic). Same scoring method as `compare.py`. |
+| `eval/inspect_chunks.py` | ChromaDB inspection tool — browse chunks by type, file, or keyword with `--text`, `--type`, `--file`, `--limit` flags. |
 | `eval/metrics.py` | Reads `agent_logs.jsonl`, computes latency / token / cost stats. |
 
 ---
@@ -94,7 +96,8 @@ POST /api/ingest  →  server.py fires repomind/ingest_repo event to Inngest
         ├── Step 1: fetch-and-chunk  (ingest.fetch_and_chunk_repo)
         │     • PyGithub walks the repo tree
         │     • skips: node_modules / .git / dist / build / files > 500 KB
-        │     • for every allowed file (.py .md .ts .tsx .js .jsx .txt):
+        │     • for every allowed file (.py .md .ts .tsx .js .jsx .txt
+        │                               .dart .go .rs .java .kt .swift .rb .cs):
         │         .py  + ast mode  →  AST chunking   (see below)
         │         .md              →  heading chunks
         │         anything else    →  naive sliding window
@@ -252,15 +255,15 @@ No H2 headings → whole file is one chunk.
 source  (example: 6 000 chars)
   │
   window  = 2 000 chars
-  overlap =    50 chars
-  step    = 1 950 chars
+  overlap =   200 chars
+  step    = 1 800 chars
   │
   ├─ chars    0 – 2000   →  chunk 0
-  ├─ chars 1950 – 3950   →  chunk 1
-  └─ chars 3900 – 5900   →  chunk 2
+  ├─ chars 1800 – 3800   →  chunk 1
+  └─ chars 3600 – 5600   →  chunk 2
 ```
 
-The 50-char overlap prevents code at a boundary from being split across two chunks with no context on either side.
+The 200-char overlap prevents code at a boundary from being split across two chunks with no context on either side.
 
 ---
 
@@ -279,8 +282,8 @@ file: src/auth.py  (120 lines, 3 functions + 1 class)
 
 ── Naive mode ───────────────────────────────────────────────
   chunk 0  →  chars 0–2000    (may end mid-function)
-  chunk 1  →  chars 1950–3950 (may start in the middle of logout)
-  chunk 2  →  chars 3900–5900 (may contain fragments of two functions)
+  chunk 1  →  chars 1800–3800 (may start in the middle of logout)
+  chunk 2  →  chars 3600–5600 (may contain fragments of two functions)
 
   Each chunk has: chunk_index, language in metadata.  No name. No lines.
 ```
@@ -399,7 +402,9 @@ frontend stores compressed_history in contextRef[collection] for next turn
 
 | Script | What it does | Output |
 |---|---|---|
-| `eval/compare.py <owner>/<repo>` | Retrieves top-3 chunks from both `_ast` and `_naive` collections for 8 benchmark queries. Asks Qwen to score each chunk 1–5 for relevance. | `frontend/public/benchmark_results.json` |
+| `eval/compare.py <owner>/<repo>` | 8 general queries. Retrieves top-3 chunks from both `_ast` and `_naive` collections, asks Qwen to score each 1–5 for relevance. | `frontend/public/benchmark_results.json` |
+| `eval/compare1.py <owner>/<repo>` | 10 Python-targeted queries designed to expose AST advantages over naive. Same scoring method. | `frontend/public/benchmark_results.json` |
+| `eval/inspect_chunks.py` | Inspect ChromaDB chunks with `--text`, `--type`, `--file`, `--limit` flags. Useful for verifying chunking output without running the full agent. | printed to stdout |
 | `eval/metrics.py` | Reads `agent_logs.jsonl`, computes avg / median / p95 latency, total tokens, cost. | printed to stdout |
 | `eval/test_queries.py` | Runs 5 fixed queries through the agent, checks answers for must-contain / must-not-contain keywords. | `eval_results.jsonl` |
 
