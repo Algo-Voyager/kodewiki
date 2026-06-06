@@ -112,7 +112,7 @@ SUPPORTED_EMBED_PROVIDERS = ("vllm", "openai", "gemini")
 DEFAULT_EMBED_MODELS = {
     "vllm":   "BAAI/bge-small-en-v1.5",
     "openai": "text-embedding-3-small",
-    "gemini": "text-embedding-004",
+    "gemini": "gemini-embedding-001",
 }
 
 _llm_provider_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(

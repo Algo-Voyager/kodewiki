@@ -36,13 +36,13 @@ export type EmbedProvider = (typeof EMBED_PROVIDERS)[number];
 export const EMBED_PROVIDER_LABEL: Record<EmbedProvider, string> = {
   vllm: "Modal (bge-small-en-v1.5, 384d) — bundled default",
   openai: "OpenAI (text-embedding-3-small, 1536d)",
-  gemini: "Google Gemini (text-embedding-004, 768d)",
+  gemini: "Google Gemini (gemini-embedding-001, 3072d)",
 };
 
 export const EMBED_PROVIDER_DEFAULT_MODEL: Record<EmbedProvider, string> = {
   vllm: "",
   openai: "text-embedding-3-small",
-  gemini: "text-embedding-004",
+  gemini: "gemini-embedding-001",
 };
 
 type StoredTokens = {
