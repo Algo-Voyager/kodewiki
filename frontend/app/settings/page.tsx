@@ -173,6 +173,7 @@ export default function SettingsPage() {
   };
 
   return (
+    <div className="h-full overflow-y-auto">
     <div className="mx-auto max-w-2xl py-10 px-6 space-y-8">
       <div>
         <h1 className="text-2xl font-semibold text-foreground">Settings</h1>
@@ -579,6 +580,7 @@ export default function SettingsPage() {
           your team owns but the deploy&apos;s token doesn&apos;t.
         </p>
       </section>
+    </div>
     </div>
   );
 }
