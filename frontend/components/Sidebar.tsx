@@ -17,9 +17,16 @@ import {
   AlertCircle,
   Database,
   ChevronRight,
+  RefreshCw,
   Settings as SettingsIcon,
 } from "lucide-react";
-import { fetchCollections, ingestRepo, type Collection } from "@/lib/api";
+import {
+  fetchCollections,
+  fetchIngestStatus,
+  ingestRepo,
+  type Collection,
+  type IngestStatus,
+} from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -67,6 +74,19 @@ const NAV = [
 
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
 
+// Bare collection name the backend will use, matching qualify_collection() in auth.py.
+function collectionNameFor(repo: string, mode: "ast" | "naive"): string {
+  const [owner, name] = repo.split("/", 2);
+  return `${owner}_${name}_${mode}`;
+}
+
+const PHASE_LABEL: Record<IngestStatus["phase"], string> = {
+  fetching: "Fetching files…",
+  embedding: "Embedding chunks…",
+  done: "Ready",
+  error: "Failed",
+};
+
 export function Sidebar() {
   const pathname = usePathname();
   const [repo, setRepo] = useState("");
@@ -75,6 +95,9 @@ export function Sidebar() {
   const [selected, setSelected] = useState<string>("");
   const [status, setStatus] = useState<{ msg: string; type: "ok" | "err" } | null>(null);
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  // Pending/recent ingests keyed by collection name; merged into the indexed-repos list.
+  const [pendingMap, setPendingMap] = useState<Record<string, IngestStatus>>({});
 
   // Resizable sidebar
   const [sidebarWidth, setSidebarWidth] = useState(220);
@@ -110,16 +133,53 @@ export function Sidebar() {
   }, [isDragging]);
 
   useEffect(() => {
-    loadCollections();
+    void loadCollections();
+    void loadIngestStatus();
   }, []);
 
-  async function loadCollections() {
-    const cols = await fetchCollections();
-    setCollections(cols);
-    if (cols.length > 0 && !selected) {
-      setSelected(cols[0].name);
-      window.dispatchEvent(new CustomEvent("collection-changed", { detail: cols[0].name }));
+  // Poll ingest-status + collections every 3 s while any entry is still in
+  // flight, so the badge count grows + the spinner clears without a reload.
+  useEffect(() => {
+    const anyPending = Object.values(pendingMap).some(
+      (p) => p.phase !== "done" && p.phase !== "error",
+    );
+    if (!anyPending) return;
+    const id = setInterval(() => {
+      void loadIngestStatus();
+      void loadCollections({ silent: true });
+    }, 3000);
+    return () => clearInterval(id);
+  }, [pendingMap]);
+
+  async function loadCollections(opts: { silent?: boolean } = {}) {
+    if (!opts.silent) setRefreshing(true);
+    try {
+      const cols = await fetchCollections();
+      setCollections(cols);
+      if (cols.length > 0 && !selected) {
+        setSelected(cols[0].name);
+        window.dispatchEvent(new CustomEvent("collection-changed", { detail: cols[0].name }));
+      }
+    } finally {
+      if (!opts.silent) setRefreshing(false);
     }
+  }
+
+  async function loadIngestStatus() {
+    const list = await fetchIngestStatus();
+    setPendingMap((prev) => {
+      const next: Record<string, IngestStatus> = { ...prev };
+      // Replace any locally-optimistic entries with the server's truth.
+      for (const s of list) next[s.collection_name] = s;
+      // Drop entries the server has GC'd that we'd marked done — keeps the
+      // sidebar in sync after the 5-minute TTL elapses.
+      for (const k of Object.keys(next)) {
+        if (!list.find((s) => s.collection_name === k)) {
+          if (next[k].phase === "done" || next[k].phase === "error") delete next[k];
+        }
+      }
+      return next;
+    });
   }
 
   async function handleIngest() {
@@ -127,14 +187,38 @@ export function Sidebar() {
       setStatus({ msg: "Format: owner/repo", type: "err" });
       return;
     }
+    const name = collectionNameFor(repo, mode);
     setLoading(true);
     setStatus(null);
+    // Optimistic add — the entry shows up in INDEXED REPOS immediately,
+    // with a spinner ring around the count badge until ingest finishes.
+    setPendingMap((prev) => ({
+      ...prev,
+      [name]: {
+        collection_name: name,
+        repo,
+        mode,
+        phase: "fetching",
+        files_seen: 0,
+        total_chunks: 0,
+        embed_errors: 0,
+        error: null,
+        started_at: Date.now() / 1000,
+        finished_at: null,
+      },
+    }));
     try {
       await ingestRepo(repo, mode);
-      setStatus({ msg: `Triggered for ${repo}`, type: "ok" });
-      setTimeout(loadCollections, 3000);
+      setStatus({ msg: `Indexing ${repo}…`, type: "ok" });
+      // First server poll fast so the UI catches the phase flip to "embedding".
+      setTimeout(() => void loadIngestStatus(), 1000);
     } catch (e: unknown) {
       setStatus({ msg: e instanceof Error ? e.message : "Ingest failed", type: "err" });
+      setPendingMap((prev) => {
+        const next = { ...prev };
+        delete next[name];
+        return next;
+      });
     } finally {
       setLoading(false);
     }
@@ -302,58 +386,118 @@ export function Sidebar() {
 
       {/* ── Indexed Repos ─────────────────────────────────────────────────── */}
       <div className="px-3 py-3 flex flex-col gap-2 flex-1 min-h-0 overflow-y-auto">
-        <div className="flex items-center gap-2 px-1">
-          <Database className="w-3 h-3 text-white/30" />
-          <p className="text-[10px] font-semibold text-white/30 uppercase tracking-widest">
-            Indexed Repos
-          </p>
+        <div className="flex items-center justify-between px-1">
+          <div className="flex items-center gap-2">
+            <Database className="w-3 h-3 text-white/30" />
+            <p className="text-[10px] font-semibold text-white/30 uppercase tracking-widest">
+              Indexed Repos
+            </p>
+          </div>
+          <button
+            onClick={() => void loadCollections()}
+            disabled={refreshing}
+            title="Refresh"
+            className="w-5 h-5 inline-flex items-center justify-center rounded text-white/30 hover:text-white/70 hover:bg-white/[0.06] transition-colors"
+          >
+            <RefreshCw className={cn("w-3 h-3", refreshing && "animate-spin")} />
+          </button>
         </div>
 
-        {collections.length === 0 ? (
-          <p className="text-[11px] text-white/20 px-1 py-1">No repos ingested yet</p>
-        ) : (
-          <div className="flex flex-col gap-1">
-            {collections.map((col) => {
-              const isActive = selected === col.name;
-              return (
-                <motion.button
-                  key={col.name}
-                  onClick={() => {
-                    setSelected(col.name);
-                    window.dispatchEvent(
-                      new CustomEvent("collection-changed", { detail: col.name })
-                    );
-                  }}
-                  whileHover={{ x: 2 }}
-                  whileTap={{ scale: 0.98 }}
-                  transition={{ type: "spring", stiffness: 400, damping: 30 }}
-                  className={cn(
-                    "flex items-center justify-between w-full px-2.5 py-2 rounded-xl text-left transition-all border",
-                    isActive
-                      ? "bg-sky-500/10 border-sky-500/25 text-white"
-                      : "border-transparent text-white/40 hover:bg-white/[0.04] hover:text-white/70"
-                  )}
-                >
-                  <div className="flex items-center gap-2 min-w-0">
-                    <div className={cn(
-                      "w-1.5 h-1.5 rounded-full shrink-0",
-                      isActive ? "bg-sky-400" : "bg-white/20"
-                    )} />
-                    <span className="text-[11px] font-medium truncate">{col.name}</span>
-                  </div>
-                  <span className={cn(
-                    "shrink-0 ml-1.5 text-[10px] font-mono px-1.5 py-0.5 rounded-md",
-                    isActive
-                      ? "bg-sky-500/20 text-sky-300"
-                      : "bg-white/[0.06] text-white/30"
-                  )}>
-                    {col.chunk_count}
-                  </span>
-                </motion.button>
-              );
-            })}
-          </div>
-        )}
+        {(() => {
+          // Merge confirmed collections with optimistic / pending ingests.
+          // A pending entry hides itself once the real collection is back AND
+          // the server reports phase=done — that's the moment the badge stops
+          // spinning. Order: pending first (so the user sees their click), then
+          // existing collections.
+          const colNames = new Set(collections.map((c) => c.name));
+          const pendingList = Object.values(pendingMap).filter(
+            (p) => p.phase !== "done" || !colNames.has(p.collection_name)
+          );
+          const merged: Array<{ name: string; chunk_count: number; pending?: IngestStatus }> = [
+            ...pendingList.map((p) => ({
+              name: p.collection_name,
+              chunk_count: p.total_chunks,
+              pending: p,
+            })),
+            ...collections
+              .filter((c) => !pendingList.find((p) => p.collection_name === c.name))
+              .map((c) => ({ name: c.name, chunk_count: c.chunk_count })),
+          ];
+
+          if (merged.length === 0) {
+            return <p className="text-[11px] text-white/20 px-1 py-1">No repos ingested yet</p>;
+          }
+          return (
+            <div className="flex flex-col gap-1">
+              {merged.map((col) => {
+                const isActive = selected === col.name;
+                const p = col.pending;
+                const isBusy = !!p && (p.phase === "fetching" || p.phase === "embedding");
+                const isFailed = !!p && p.phase === "error";
+                return (
+                  <motion.button
+                    key={col.name}
+                    onClick={() => {
+                      if (isBusy) return; // can't open a still-ingesting repo
+                      setSelected(col.name);
+                      window.dispatchEvent(
+                        new CustomEvent("collection-changed", { detail: col.name })
+                      );
+                    }}
+                    whileHover={!isBusy ? { x: 2 } : undefined}
+                    whileTap={!isBusy ? { scale: 0.98 } : undefined}
+                    transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                    className={cn(
+                      "flex flex-col w-full px-2.5 py-2 rounded-xl text-left transition-all border",
+                      isActive
+                        ? "bg-sky-500/10 border-sky-500/25 text-white"
+                        : isFailed
+                          ? "border-red-500/20 text-red-300/80 hover:bg-red-500/5"
+                          : "border-transparent text-white/40 hover:bg-white/[0.04] hover:text-white/70",
+                      isBusy && "cursor-default"
+                    )}
+                  >
+                    <div className="flex items-center justify-between w-full">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div className={cn(
+                          "w-1.5 h-1.5 rounded-full shrink-0",
+                          isActive ? "bg-sky-400" : isFailed ? "bg-red-400" : "bg-white/20"
+                        )} />
+                        <span className="text-[11px] font-medium truncate">{col.name}</span>
+                      </div>
+                      <span className={cn(
+                        "relative shrink-0 ml-1.5 text-[10px] font-mono px-1.5 py-0.5 rounded-md",
+                        isActive
+                          ? "bg-sky-500/20 text-sky-300"
+                          : isFailed
+                            ? "bg-red-500/15 text-red-300"
+                            : "bg-white/[0.06] text-white/30",
+                      )}>
+                        {/* Spinner ring around the count badge while ingesting. */}
+                        {isBusy && (
+                          <span className="absolute -inset-[2px] rounded-md border border-sky-400/40 border-t-sky-400 animate-spin" />
+                        )}
+                        <span className="relative">{col.chunk_count}</span>
+                      </span>
+                    </div>
+                    {p && (
+                      <p className={cn(
+                        "mt-1 pl-3.5 text-[10px] truncate",
+                        isFailed ? "text-red-300/80" : "text-white/40"
+                      )}>
+                        {isFailed
+                          ? (p.error || "Failed").slice(0, 80)
+                          : p.phase === "embedding" && p.total_chunks > 0
+                            ? `${PHASE_LABEL[p.phase]} (${p.total_chunks} chunks)`
+                            : PHASE_LABEL[p.phase]}
+                      </p>
+                    )}
+                  </motion.button>
+                );
+              })}
+            </div>
+          );
+        })()}
       </div>
 
       {/* ── Footer ───────────────────────────────────────────────────────── */}

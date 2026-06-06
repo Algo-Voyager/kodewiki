@@ -60,6 +60,31 @@ logger = logging.getLogger("uvicorn")
 # In-memory result cache keyed by event_id (used as session_id in run_agent_fn).
 _RESULT_CACHE: dict[str, dict] = {}
 
+# In-memory ingest tracker — keyed by QUALIFIED collection name. The status
+# endpoint filters by tenant on read. Phase moves through:
+#   fetching → embedding → done / error
+# "done" / "error" entries linger for _INGEST_TTL_SECONDS so the UI can show
+# the final state once, then are garbage-collected on the next read.
+_INGEST_STATUS: dict[str, dict] = {}
+_INGEST_TTL_SECONDS = 300
+
+
+def _set_ingest_status(qualified_name: str, **fields) -> None:
+    import time as _t
+    entry = _INGEST_STATUS.get(qualified_name, {"started_at": _t.time()})
+    entry.update(fields)
+    _INGEST_STATUS[qualified_name] = entry
+
+
+def _cleanup_ingest_status() -> None:
+    import time as _t
+    now = _t.time()
+    for k in list(_INGEST_STATUS):
+        v = _INGEST_STATUS[k]
+        finished = v.get("finished_at")
+        if v.get("phase") in ("done", "error") and finished and now - finished > _INGEST_TTL_SECONDS:
+            del _INGEST_STATUS[k]
+
 # ─── History compression constants ──────────────────────────────────────────
 _HISTORY_COMPRESS_THRESHOLD = 12_000   # chars — trigger compression above this
 _HISTORY_CHAR_LIMIT = 16_000           # hard cap sent from frontend
@@ -96,6 +121,7 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
       embed-and-store  — embed every chunk via Modal, upsert ChromaDB
       log-summary      — structured log with totals, errors, and latency
     """
+    import time as _t
     repo_slug: str = ctx.event.data["repo"]
     mode: str = ctx.event.data.get("mode", "ast")
     event_id: str = ctx.event.id
@@ -107,52 +133,93 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
     set_vllm_api_key_override(ctx.event.data.get("vllm_api_key"))
     set_tenant_id_override(tenant_id)
 
-    # Step 1: fetch and chunk — async so PyGithub HTTP calls don't block the loop
-    async def _fetch_and_chunk() -> dict:
-        import asyncio as _aio
-        return await _aio.to_thread(fetch_and_chunk_repo, repo_slug, mode, event_id, tenant_id)
+    # Precompute the qualified collection name so the sidebar UI can poll for
+    # progress under the same key the agent will later read.
+    owner_repo = repo_slug.replace("/", "_") if "/" in repo_slug else repo_slug
+    qualified_name = qualify_collection(f"{owner_repo}_{mode}", tenant_id)
+    _set_ingest_status(
+        qualified_name,
+        tenant_id=tenant_id,
+        repo=repo_slug,
+        mode=mode,
+        phase="fetching",
+        files_seen=0,
+        total_chunks=0,
+        embed_errors=0,
+        error=None,
+        finished_at=None,
+    )
 
-    chunks_data = await ctx.step.run("fetch-and-chunk", _fetch_and_chunk)
+    try:
+        # Step 1: fetch and chunk — async so PyGithub HTTP calls don't block the loop
+        async def _fetch_and_chunk() -> dict:
+            import asyncio as _aio
+            return await _aio.to_thread(fetch_and_chunk_repo, repo_slug, mode, event_id, tenant_id)
 
-    # Step 2: validate before embedding
-    def _validate(d: dict) -> dict:
-        issues = []
-        if d.get("files_seen", 0) == 0:
-            issues.append("no_files_found")
-        if d.get("total_chunks", 0) == 0:
-            issues.append("no_chunks_produced")
-        if issues:
-            logger.warning(
-                "repomind/ingest_repo validate: repo=%s issues=%s",
-                repo_slug, issues,
-            )
-        return {"valid": len(issues) == 0, "issues": issues}
-
-    validated = await ctx.step.run("validate-chunks", lambda: _validate(chunks_data))
-
-    # Step 3: embed and store — async so Modal embed API calls don't block the loop
-    async def _embed_and_store() -> dict:
-        import asyncio as _aio
-        return await _aio.to_thread(embed_and_store_chunks, chunks_data)
-
-    result = await ctx.step.run("embed-and-store", _embed_and_store)
-
-    # Step 4: log summary
-    def _log_summary(r: dict, v: dict) -> dict:
-        embed_errors = r.get("embed_errors", 0)
-        msg = (
-            f"repomind/ingest_repo done: repo={repo_slug} "
-            f"collection={r['collection_name']} chunks={r['total_chunks']} "
-            f"files={r.get('files_seen', 0)} embed_errors={embed_errors}"
+        chunks_data = await ctx.step.run("fetch-and-chunk", _fetch_and_chunk)
+        _set_ingest_status(
+            qualified_name,
+            phase="embedding",
+            files_seen=chunks_data.get("files_seen", 0),
+            total_chunks=chunks_data.get("total_chunks", 0),
         )
-        if v["issues"] or embed_errors > 0:
-            logger.warning(msg + f" issues={v['issues']}")
-        else:
-            logger.info(msg)
-        return {"logged": True}
 
-    await ctx.step.run("log-summary", lambda: _log_summary(result, validated))
-    return result
+        # Step 2: validate before embedding
+        def _validate(d: dict) -> dict:
+            issues = []
+            if d.get("files_seen", 0) == 0:
+                issues.append("no_files_found")
+            if d.get("total_chunks", 0) == 0:
+                issues.append("no_chunks_produced")
+            if issues:
+                logger.warning(
+                    "repomind/ingest_repo validate: repo=%s issues=%s",
+                    repo_slug, issues,
+                )
+            return {"valid": len(issues) == 0, "issues": issues}
+
+        validated = await ctx.step.run("validate-chunks", lambda: _validate(chunks_data))
+
+        # Step 3: embed and store — async so Modal embed API calls don't block the loop
+        async def _embed_and_store() -> dict:
+            import asyncio as _aio
+            return await _aio.to_thread(embed_and_store_chunks, chunks_data)
+
+        result = await ctx.step.run("embed-and-store", _embed_and_store)
+
+        # Step 4: log summary
+        def _log_summary(r: dict, v: dict) -> dict:
+            embed_errors = r.get("embed_errors", 0)
+            msg = (
+                f"repomind/ingest_repo done: repo={repo_slug} "
+                f"collection={r['collection_name']} chunks={r['total_chunks']} "
+                f"files={r.get('files_seen', 0)} embed_errors={embed_errors}"
+            )
+            if v["issues"] or embed_errors > 0:
+                logger.warning(msg + f" issues={v['issues']}")
+            else:
+                logger.info(msg)
+            return {"logged": True}
+
+        await ctx.step.run("log-summary", lambda: _log_summary(result, validated))
+        _set_ingest_status(
+            qualified_name,
+            phase="done",
+            finished_at=_t.time(),
+            total_chunks=result.get("total_chunks", 0),
+            embed_errors=result.get("embed_errors", 0),
+        )
+        return result
+    except Exception as exc:
+        # Surface failure to the sidebar UI; re-raise so Inngest still records
+        # the failure + applies its retry policy.
+        _set_ingest_status(
+            qualified_name,
+            phase="error",
+            finished_at=_t.time(),
+            error=str(exc)[:200],
+        )
+        raise
 
 
 # ─── Inngest function 2: agent run ──────────────────────────────────────────
@@ -509,6 +576,44 @@ async def trigger_query(req: QueryRequest, request: Request):
         )
     )
     return {"status": "triggered", "session_id": session_id}
+
+
+@app.get("/api/ingest/status")
+async def ingest_status(request: Request):
+    """List in-progress / recently-finished ingests for this tenant.
+
+    Returns:
+        {
+          pending: [
+            {collection_name, repo, mode, phase, files_seen, total_chunks,
+             embed_errors, error, started_at, finished_at}
+          ]
+        }
+
+    Phase values: fetching | embedding | done | error.
+    The frontend polls this while there's any non-``done`` entry; ``done`` /
+    ``error`` entries linger for 5 min so the UI can show the final state once.
+    """
+    tenant_id = _extract_tenant_id(request)
+    _cleanup_ingest_status()
+    out = []
+    for qname, entry in _INGEST_STATUS.items():
+        if entry.get("tenant_id") != tenant_id:
+            continue
+        _, bare = strip_tenant(qname)
+        out.append({
+            "collection_name": bare,
+            "repo": entry.get("repo", ""),
+            "mode": entry.get("mode", ""),
+            "phase": entry.get("phase", "fetching"),
+            "files_seen": entry.get("files_seen", 0),
+            "total_chunks": entry.get("total_chunks", 0),
+            "embed_errors": entry.get("embed_errors", 0),
+            "error": entry.get("error"),
+            "started_at": entry.get("started_at"),
+            "finished_at": entry.get("finished_at"),
+        })
+    return {"pending": out}
 
 
 @app.get("/api/result/{session_id}")

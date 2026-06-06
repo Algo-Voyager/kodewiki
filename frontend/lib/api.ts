@@ -117,6 +117,28 @@ export async function fetchCollections(): Promise<Collection[]> {
   return data.collections ?? [];
 }
 
+export type IngestPhase = "fetching" | "embedding" | "done" | "error";
+
+export interface IngestStatus {
+  collection_name: string;
+  repo: string;
+  mode: string;
+  phase: IngestPhase;
+  files_seen: number;
+  total_chunks: number;
+  embed_errors: number;
+  error: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+}
+
+export async function fetchIngestStatus(): Promise<IngestStatus[]> {
+  const res = await fetch(`${BASE}/ingest/status`, { headers: authHeaders() });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.pending ?? [];
+}
+
 export async function ingestRepo(repo: string, mode: string): Promise<void> {
   const res = await fetch(`${BASE}/ingest`, {
     method: "POST",
