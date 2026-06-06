@@ -199,6 +199,16 @@ export async function fetchIngestStatus(): Promise<IngestStatus[]> {
   return data.pending ?? [];
 }
 
+export async function deleteCollection(name: string): Promise<boolean> {
+  const res = await fetch(`${BASE}/collections/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(`Delete failed (${res.status})`);
+  const data = await res.json();
+  return !!data.deleted;
+}
+
 export async function ingestRepo(repo: string, mode: string): Promise<void> {
   const res = await fetch(`${BASE}/ingest`, {
     method: "POST",

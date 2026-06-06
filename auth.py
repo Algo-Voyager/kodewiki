@@ -209,3 +209,24 @@ def belongs_to(name: str, tenant_id: str | None = None) -> bool:
     """True if a qualified collection name belongs to the given tenant."""
     tid = tenant_id or get_tenant_id()
     return name.startswith(f"{tid}{TENANT_SEP}")
+
+
+# ─── Cooperative ingest cancellation ────────────────────────────────────────
+# When a user clicks the trash icon on an in-flight ingest, we mark the
+# qualified collection name as cancelled here. The embed loop in ingest.py
+# checks ``is_ingest_cancelled`` between chunks and bails out, so a mid-flight
+# ingest is actually stopped rather than left to finish writing rows the user
+# just deleted.
+_cancelled_ingests: set[str] = set()
+
+
+def mark_ingest_cancelled(qualified_name: str) -> None:
+    _cancelled_ingests.add(qualified_name)
+
+
+def is_ingest_cancelled(qualified_name: str) -> bool:
+    return qualified_name in _cancelled_ingests
+
+
+def clear_ingest_cancelled(qualified_name: str) -> None:
+    _cancelled_ingests.discard(qualified_name)

@@ -18,9 +18,11 @@ import {
   Database,
   ChevronRight,
   RefreshCw,
+  Trash2,
   Settings as SettingsIcon,
 } from "lucide-react";
 import {
+  deleteCollection,
   fetchCollections,
   fetchIngestStatus,
   ingestRepo,
@@ -180,6 +182,37 @@ export function Sidebar() {
       }
       return next;
     });
+  }
+
+  async function handleDelete(name: string) {
+    const confirmed = window.confirm(
+      `Delete "${name}"?\n\nThis removes its chunks from the vector DB and ` +
+      `aborts any in-flight ingest. Cannot be undone.`
+    );
+    if (!confirmed) return;
+
+    // Optimistic remove — feels instant; if the call fails we re-fetch + show error.
+    setCollections((prev) => prev.filter((c) => c.name !== name));
+    setPendingMap((prev) => {
+      const next = { ...prev };
+      delete next[name];
+      return next;
+    });
+    if (selected === name) {
+      setSelected("");
+      window.dispatchEvent(new CustomEvent("collection-changed", { detail: "" }));
+    }
+    try {
+      await deleteCollection(name);
+    } catch (e: unknown) {
+      setStatus({
+        msg: e instanceof Error ? e.message : "Delete failed",
+        type: "err",
+      });
+      // Restore by reloading authoritative state.
+      void loadCollections({ silent: true });
+      void loadIngestStatus();
+    }
   }
 
   async function handleIngest() {
@@ -435,50 +468,67 @@ export function Sidebar() {
                 const isBusy = !!p && (p.phase === "fetching" || p.phase === "embedding");
                 const isFailed = !!p && p.phase === "error";
                 return (
-                  <motion.button
+                  <div
                     key={col.name}
-                    onClick={() => {
-                      if (isBusy) return; // can't open a still-ingesting repo
-                      setSelected(col.name);
-                      window.dispatchEvent(
-                        new CustomEvent("collection-changed", { detail: col.name })
-                      );
-                    }}
-                    whileHover={!isBusy ? { x: 2 } : undefined}
-                    whileTap={!isBusy ? { scale: 0.98 } : undefined}
-                    transition={{ type: "spring", stiffness: 400, damping: 30 }}
                     className={cn(
-                      "flex flex-col w-full px-2.5 py-2 rounded-xl text-left transition-all border",
+                      "group/repo flex flex-col w-full px-2.5 py-2 rounded-xl border transition-all",
                       isActive
                         ? "bg-sky-500/10 border-sky-500/25 text-white"
                         : isFailed
                           ? "border-red-500/20 text-red-300/80 hover:bg-red-500/5"
                           : "border-transparent text-white/40 hover:bg-white/[0.04] hover:text-white/70",
-                      isBusy && "cursor-default"
                     )}
                   >
-                    <div className="flex items-center justify-between w-full">
-                      <div className="flex items-center gap-2 min-w-0">
+                    <div className="flex items-center justify-between w-full gap-1.5">
+                      <motion.button
+                        onClick={() => {
+                          if (isBusy) return; // can't open a still-ingesting repo
+                          setSelected(col.name);
+                          window.dispatchEvent(
+                            new CustomEvent("collection-changed", { detail: col.name })
+                          );
+                        }}
+                        whileHover={!isBusy ? { x: 2 } : undefined}
+                        whileTap={!isBusy ? { scale: 0.98 } : undefined}
+                        transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                        disabled={isBusy}
+                        className={cn(
+                          "flex items-center gap-2 min-w-0 flex-1 text-left",
+                          isBusy && "cursor-default"
+                        )}
+                      >
                         <div className={cn(
                           "w-1.5 h-1.5 rounded-full shrink-0",
                           isActive ? "bg-sky-400" : isFailed ? "bg-red-400" : "bg-white/20"
                         )} />
                         <span className="text-[11px] font-medium truncate">{col.name}</span>
+                      </motion.button>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <span className={cn(
+                          "relative text-[10px] font-mono px-1.5 py-0.5 rounded-md",
+                          isActive
+                            ? "bg-sky-500/20 text-sky-300"
+                            : isFailed
+                              ? "bg-red-500/15 text-red-300"
+                              : "bg-white/[0.06] text-white/30",
+                        )}>
+                          {/* Spinner ring around the count badge while ingesting. */}
+                          {isBusy && (
+                            <span className="absolute -inset-[2px] rounded-md border border-sky-400/40 border-t-sky-400 animate-spin" />
+                          )}
+                          <span className="relative">{col.chunk_count}</span>
+                        </span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handleDelete(col.name);
+                          }}
+                          title={isBusy ? "Cancel ingest & delete" : "Delete collection"}
+                          className="w-5 h-5 inline-flex items-center justify-center rounded text-white/25 hover:text-red-400 hover:bg-red-500/10 opacity-0 group-hover/repo:opacity-100 transition-all"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
                       </div>
-                      <span className={cn(
-                        "relative shrink-0 ml-1.5 text-[10px] font-mono px-1.5 py-0.5 rounded-md",
-                        isActive
-                          ? "bg-sky-500/20 text-sky-300"
-                          : isFailed
-                            ? "bg-red-500/15 text-red-300"
-                            : "bg-white/[0.06] text-white/30",
-                      )}>
-                        {/* Spinner ring around the count badge while ingesting. */}
-                        {isBusy && (
-                          <span className="absolute -inset-[2px] rounded-md border border-sky-400/40 border-t-sky-400 animate-spin" />
-                        )}
-                        <span className="relative">{col.chunk_count}</span>
-                      </span>
                     </div>
                     {p && (
                       <p className={cn(
@@ -492,7 +542,7 @@ export function Sidebar() {
                             : PHASE_LABEL[p.phase]}
                       </p>
                     )}
-                  </motion.button>
+                  </div>
                 );
               })}
             </div>

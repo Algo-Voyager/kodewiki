@@ -43,6 +43,8 @@ from auth import (
     SHARED_TENANT,
     TENANT_SEP,
     belongs_to,
+    clear_ingest_cancelled,
+    mark_ingest_cancelled,
     qualify_collection,
     set_github_token_override,
     set_llm_api_key_override,
@@ -143,6 +145,9 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
     # progress under the same key the agent will later read.
     owner_repo = repo_slug.replace("/", "_") if "/" in repo_slug else repo_slug
     qualified_name = qualify_collection(f"{owner_repo}_{mode}", tenant_id)
+    # If the user previously cancelled this collection and is now re-ingesting,
+    # wipe the stale cancellation marker so this run isn't aborted at start.
+    clear_ingest_cancelled(qualified_name)
     _set_ingest_status(
         qualified_name,
         tenant_id=tenant_id,
@@ -217,8 +222,14 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
         )
         return result
     except Exception as exc:
-        # Surface failure to the sidebar UI; re-raise so Inngest still records
-        # the failure + applies its retry policy.
+        # IngestCancelled = user clicked delete mid-flight — drop the status
+        # entirely rather than show a red "error" line for a deletion they asked
+        # for. Other exceptions = real failure; surface to the sidebar UI.
+        from ingest import IngestCancelled
+        if isinstance(exc, IngestCancelled):
+            _INGEST_STATUS.pop(qualified_name, None)
+            logger.info("repomind/ingest_repo cancelled: %s", qualified_name)
+            return {"cancelled": True}
         _set_ingest_status(
             qualified_name,
             phase="error",
@@ -776,6 +787,43 @@ async def list_chunks(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/collections/{name}")
+async def delete_collection(name: str, request: Request):
+    """Delete a collection (Chroma + ingest-status tracker) for the calling tenant.
+
+    Idempotent: a missing collection returns 200 with ``deleted=false``. Sets a
+    cancellation flag first so any in-flight ingest aborts before its next
+    upsert — without this, a delete during embedding would let the job
+    re-create the collection seconds later.
+    """
+    tenant_id = _extract_tenant_id(request)
+    bare_name = strip_tenant(name)[1]
+    qualified = qualify_collection(bare_name, tenant_id)
+
+    # 1. Mark cancelled — any embed loop on this collection sees this on its
+    # next iteration and raises IngestCancelled, which the Inngest handler
+    # catches and surfaces as phase="error".
+    mark_ingest_cancelled(qualified)
+
+    # 2. Drop the in-memory status so the sidebar UI stops listing it.
+    _INGEST_STATUS.pop(qualified, None)
+
+    # 3. Drop the Chroma collection. Best-effort — Chroma raises if the
+    # collection doesn't exist, which is fine here (idempotent semantics).
+    deleted = False
+    try:
+        client = chromadb.PersistentClient(path=os.getenv("CHROMA_DB_PATH", "./chroma_db"))
+        try:
+            client.delete_collection(qualified)
+            deleted = True
+        except Exception:
+            pass
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"deleted": deleted, "collection_name": bare_name}
 
 
 @app.get("/api/logs")

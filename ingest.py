@@ -516,14 +516,27 @@ def fetch_and_chunk_repo(
     }
 
 
+class IngestCancelled(RuntimeError):
+    """Raised by embed_and_store_chunks when the dashboard cancels the ingest mid-flight."""
+
+
 def embed_and_store_chunks(chunks_data: dict) -> dict:
     """Step 2: Read the temp JSONL from fetch_and_chunk_repo, embed, upsert ChromaDB.
 
     The temp file is cleaned up in a finally block so a failed/retried step 2
     can still find its input on retry (the file is only deleted on success).
+
+    Cooperatively cancellable — the dashboard's DELETE endpoint sets a flag in
+    ``auth._cancelled_ingests``; this loop checks it between chunks and raises
+    ``IngestCancelled`` so a deleted collection doesn't get rebuilt mid-flight.
     """
+    from auth import is_ingest_cancelled
+
     collection_name: str = chunks_data["collection_name"]
     temp_path: str = chunks_data["temp_path"]
+
+    if is_ingest_cancelled(collection_name):
+        raise IngestCancelled(f"Ingest cancelled before start: {collection_name}")
 
     client = chromadb.PersistentClient(path=os.getenv("CHROMA_DB_PATH", "./chroma_db"))
     collection = client.get_or_create_collection(collection_name)
@@ -533,6 +546,10 @@ def embed_and_store_chunks(chunks_data: dict) -> dict:
     try:
         with open(temp_path, encoding="utf-8") as f:
             for line in f:
+                if is_ingest_cancelled(collection_name):
+                    raise IngestCancelled(
+                        f"Ingest cancelled at chunk {total}: {collection_name}"
+                    )
                 line = line.strip()
                 if not line:
                     continue
