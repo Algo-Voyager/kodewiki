@@ -47,7 +47,15 @@ _TOOL_METRICS: ContextVar[dict] = ContextVar("_TOOL_METRICS", default={})
 
 
 def _parse_owner_repo(collection_name: str) -> tuple[str, str]:
-    """Collection names are f'{owner}_{name}_{mode}' — strip mode, then split."""
+    """Extract (owner, repo) from a collection name.
+
+    Accepts either the bare form ``{owner}_{name}_{mode}`` or the tenant-
+    qualified form ``{tenant_id}__{owner}_{name}_{mode}``. Tenant prefix is
+    stripped first so multi-tenant routing doesn't break PyGithub lookups.
+    """
+    from auth import TENANT_SEP
+    if TENANT_SEP in collection_name:
+        collection_name = collection_name.split(TENANT_SEP, 1)[1]
     without_mode = collection_name.rsplit("_", 1)[0]
     owner, _, repo = without_mode.partition("_")
     if not owner or not repo:

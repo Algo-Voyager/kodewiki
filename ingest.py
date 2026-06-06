@@ -449,12 +449,21 @@ def embed(text: str) -> list[float]:
     return resp.data[0].embedding
 
 
-def fetch_and_chunk_repo(repo_slug: str, mode: str, event_id: str = "cli") -> dict:
+def fetch_and_chunk_repo(
+    repo_slug: str,
+    mode: str,
+    event_id: str = "cli",
+    tenant_id: str | None = None,
+) -> dict:
     """Step 1: Walk a GitHub repo, chunk every file, write to a temp JSONL on disk.
 
     The temp file is named with *event_id* so Inngest retries are idempotent —
     a retry of this step will overwrite the same file rather than producing a
     duplicate.
+
+    *tenant_id* qualifies the collection name so two anonymous users ingesting
+    the same repo never collide. Omit to use the ContextVar default (CLI runs
+    fall back to ``SHARED_TENANT``).
 
     Returns a small dict (safe to serialise as an Inngest step result):
         {collection_name, temp_path, files_seen, total_chunks}
@@ -465,11 +474,11 @@ def fetch_and_chunk_repo(repo_slug: str, mode: str, event_id: str = "cli") -> di
     owner, name = repo_slug.split("/", 1)
 
     # ContextVar override (PAT from dashboard Settings) wins; env-var is fallback.
-    from auth import get_github_token
+    from auth import get_github_token, qualify_collection
     gh = Github(auth=Auth.Token(get_github_token()))
     repo = gh.get_repo(repo_slug)
 
-    collection_name = f"{owner}_{name}_{mode}"
+    collection_name = qualify_collection(f"{owner}_{name}_{mode}", tenant_id)
     safe_event_id = event_id.replace("/", "-")[:40]
     temp_path = str(Path(os.getenv("CHROMA_DB_PATH", "./chroma_db")) / f".chunks_{collection_name}_{safe_event_id}.jsonl")
     Path(temp_path).parent.mkdir(parents=True, exist_ok=True)

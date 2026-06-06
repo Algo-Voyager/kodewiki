@@ -1,18 +1,22 @@
-"""Per-request override for the GitHub PAT.
+"""Per-request overrides for credentials + tenancy.
 
-When a request hits /api/ingest or /api/query with an `X-Github-Token` header,
-the Inngest function handler stores that token in a ContextVar at the start of
-the run. GitHub-using code (`tools.py`, `ingest.py`) then reads via
-`get_github_token()` — the override wins, with the env-var as fallback.
+Three ContextVars carry per-request state set by REST handlers (and forwarded
+into Inngest function handlers via event data):
 
-This keeps the codebase ContextVar-clean (no `os.environ` monkey-patching, no
-thread-safety hazards) and lets a dashboard user paste their own PAT if the
-deployed env-var token has expired or rate-limited.
+  GitHub PAT       — X-Github-Token header  → get_github_token()
+  LLM Bearer key   — X-VLLM-Key header      → get_vllm_api_key()
+  Tenant ID        — X-Tenant-Id header     → get_tenant_id()
+
+Tenants isolate anonymous users — a UUID minted in the browser scopes every
+ChromaDB collection, every agent log entry, every metric. With no header, the
+tenant falls back to ``SHARED_TENANT`` (used by CLI ingests + local smoke
+tests, never reachable from the browser because browsers always send a UUID).
 """
 from __future__ import annotations
 
 import contextvars
 import os
+import re
 
 _github_token_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "github_token_override", default=None
@@ -24,6 +28,21 @@ _github_token_override: contextvars.ContextVar[str | None] = contextvars.Context
 _vllm_api_key_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "vllm_api_key_override", default=None
 )
+
+# Per-request tenant ID (UUID). Set from X-Tenant-Id header. Falls back to
+# SHARED_TENANT when missing so CLI ingests + dev have a consistent home.
+_tenant_id_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "tenant_id_override", default=None
+)
+
+SHARED_TENANT = "shared"
+# Double-underscore separator between tenant + repo slug. UUIDs only contain
+# hex + single hyphens, so "__" cannot appear inside a tenant ID and the split
+# is unambiguous.
+TENANT_SEP = "__"
+# Whitelist tenant IDs to a safe character class. Block anything path-y or
+# containing the separator to keep qualify/strip reversible.
+_TENANT_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
 def set_github_token_override(token: str | None) -> None:
@@ -64,3 +83,60 @@ def get_vllm_api_key() -> str:
     if key:
         return key
     return os.getenv("VLLM_API_KEY", "")
+
+
+# ─── Tenancy ────────────────────────────────────────────────────────────────
+
+def set_tenant_id_override(tenant_id: str | None) -> None:
+    """Set the per-context tenant. Pass None or "" to clear (falls back to SHARED_TENANT)."""
+    if tenant_id is None:
+        _tenant_id_override.set(None)
+        return
+    tid = tenant_id.strip()
+    if not tid or not _TENANT_RE.match(tid) or TENANT_SEP in tid:
+        _tenant_id_override.set(None)
+        return
+    _tenant_id_override.set(tid)
+
+
+def get_tenant_id() -> str:
+    """Return the effective tenant ID — override first, ``SHARED_TENANT`` otherwise.
+
+    Always returns a non-empty string safe to embed in a collection name.
+    """
+    tid = _tenant_id_override.get()
+    return tid or SHARED_TENANT
+
+
+def qualify_collection(name: str, tenant_id: str | None = None) -> str:
+    """Prefix a bare collection name with the tenant scope.
+
+    >>> qualify_collection("0xnktd_fireranger_ast", "abc-123")
+    'abc-123__0xnktd_fireranger_ast'
+
+    Idempotent: if ``name`` already starts with the tenant prefix it's returned
+    unchanged. Pass ``tenant_id=None`` to read it from the ContextVar.
+    """
+    tid = tenant_id or get_tenant_id()
+    prefix = f"{tid}{TENANT_SEP}"
+    if name.startswith(prefix):
+        return name
+    return prefix + name
+
+
+def strip_tenant(name: str) -> tuple[str, str]:
+    """Split a qualified collection name into (tenant_id, bare_name).
+
+    If ``name`` lacks the ``tenant__`` prefix, returns ("", name) — used by the
+    list endpoint to filter out pre-existing legacy collections.
+    """
+    if TENANT_SEP not in name:
+        return "", name
+    tid, _, bare = name.partition(TENANT_SEP)
+    return tid, bare
+
+
+def belongs_to(name: str, tenant_id: str | None = None) -> bool:
+    """True if a qualified collection name belongs to the given tenant."""
+    tid = tenant_id or get_tenant_id()
+    return name.startswith(f"{tid}{TENANT_SEP}")

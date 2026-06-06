@@ -2,8 +2,9 @@
 
 Each call to ``log_step`` appends one JSON object per line to
 ``agent_logs.jsonl`` (override with the ``AGENT_LOG_FILE`` env var).
-``get_recent_logs`` and ``get_session_logs`` are thin readers used by
-the Streamlit UI.
+Every entry is tagged with the request's tenant ID so the dashboard's
+``/api/logs`` endpoint can scope reads to one tenant — no cross-user leakage.
+``get_recent_logs`` and ``get_session_logs`` are thin readers used by the UI.
 """
 
 from __future__ import annotations
@@ -17,15 +18,30 @@ from typing import Any, Iterator
 LOG_FILE = Path(os.getenv("AGENT_LOG_FILE", "agent_logs.jsonl"))
 
 
+def _resolve_tenant() -> str:
+    """Best-effort tenant lookup. Local import keeps logger usable from auth."""
+    try:
+        from auth import get_tenant_id
+        return get_tenant_id()
+    except Exception:
+        return "shared"
+
+
 def log_step(
     session_id: str,
     step: int,
     event_type: str,
     data: dict[str, Any],
+    tenant_id: str | None = None,
 ) -> None:
-    """Append one structured event to the log file."""
+    """Append one structured event to the log file.
+
+    *tenant_id* defaults to the current request's tenant (ContextVar). Pass it
+    explicitly only when the caller is outside the request scope.
+    """
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tenant_id": tenant_id or _resolve_tenant(),
         "session_id": session_id,
         "step": step,
         "event": event_type,
@@ -46,11 +62,22 @@ def _iter_entries() -> Iterator[dict]:
                 yield json.loads(line)
 
 
-def get_recent_logs(n: int = 50) -> list[dict]:
-    """Return the last ``n`` log entries in chronological order."""
-    return list(_iter_entries())[-n:]
+def _match_tenant(entry: dict, tenant_id: str | None) -> bool:
+    """Filter helper. None = no filter; entries missing tenant_id (legacy logs)
+    are only visible to the ``shared`` tenant so old data isn't leaked."""
+    if tenant_id is None:
+        return True
+    return entry.get("tenant_id", "shared") == tenant_id
 
 
-def get_session_logs(session_id: str) -> list[dict]:
-    """Return every entry belonging to ``session_id`` in the order written."""
-    return [e for e in _iter_entries() if e["session_id"] == session_id]
+def get_recent_logs(n: int = 50, tenant_id: str | None = None) -> list[dict]:
+    """Return the last ``n`` log entries (chronological), filtered by tenant."""
+    return [e for e in _iter_entries() if _match_tenant(e, tenant_id)][-n:]
+
+
+def get_session_logs(session_id: str, tenant_id: str | None = None) -> list[dict]:
+    """Return every entry belonging to ``session_id`` for this tenant."""
+    return [
+        e for e in _iter_entries()
+        if e["session_id"] == session_id and _match_tenant(e, tenant_id)
+    ]

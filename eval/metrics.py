@@ -29,16 +29,24 @@ def _estimate_cost_usd(input_tokens: int, output_tokens: int) -> float:
     ) / 1_000_000
 
 
-def _load_all() -> list[dict]:
+def _load_all(tenant_id: str | None = None) -> list[dict]:
+    """Read every JSONL entry, optionally scoped to one tenant.
+
+    Legacy entries without a ``tenant_id`` field are treated as belonging to the
+    ``shared`` tenant — same convention as ``logger._match_tenant``.
+    """
     if not LOG_FILE.exists():
         return []
     with LOG_FILE.open(encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        entries = [json.loads(line) for line in f if line.strip()]
+    if tenant_id is None:
+        return entries
+    return [e for e in entries if e.get("tenant_id", "shared") == tenant_id]
 
 
-def compute_session_metrics(session_id: str) -> dict:
+def compute_session_metrics(session_id: str, tenant_id: str | None = None) -> dict:
     """For a single session: latency totals, step/tool counts, token usage, cost."""
-    logs = [l for l in _load_all() if l["session_id"] == session_id]
+    logs = [l for l in _load_all(tenant_id) if l["session_id"] == session_id]
     if not logs:
         return {}
 
@@ -75,14 +83,14 @@ def compute_session_metrics(session_id: str) -> dict:
     }
 
 
-def compute_aggregate_metrics() -> dict:
-    """Across all sessions in the log file."""
-    all_logs = _load_all()
+def compute_aggregate_metrics(tenant_id: str | None = None) -> dict:
+    """Across all sessions in the log file (scoped to a tenant if given)."""
+    all_logs = _load_all(tenant_id)
     if not all_logs:
         return {}
 
     sessions = {l["session_id"] for l in all_logs}
-    per_session = [compute_session_metrics(s) for s in sessions]
+    per_session = [compute_session_metrics(s, tenant_id) for s in sessions]
     per_session = [s for s in per_session if s.get("total_latency_s")]
 
     if not per_session:

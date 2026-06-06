@@ -39,7 +39,16 @@ from pydantic import BaseModel
 
 import chromadb
 
-from auth import set_github_token_override, set_vllm_api_key_override
+from auth import (
+    SHARED_TENANT,
+    TENANT_SEP,
+    belongs_to,
+    qualify_collection,
+    set_github_token_override,
+    set_tenant_id_override,
+    set_vllm_api_key_override,
+    strip_tenant,
+)
 from eval.metrics import compute_aggregate_metrics
 from ingest import embed_and_store_chunks, fetch_and_chunk_repo
 from inngest_setup import inngest_client
@@ -90,16 +99,18 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
     repo_slug: str = ctx.event.data["repo"]
     mode: str = ctx.event.data.get("mode", "ast")
     event_id: str = ctx.event.id
+    tenant_id: str = ctx.event.data.get("tenant_id") or SHARED_TENANT
 
     # User-supplied overrides from the dashboard Settings page (X-* headers
     # plumbed through Inngest event data). Each falls back to its env var.
     set_github_token_override(ctx.event.data.get("github_token"))
     set_vllm_api_key_override(ctx.event.data.get("vllm_api_key"))
+    set_tenant_id_override(tenant_id)
 
     # Step 1: fetch and chunk — async so PyGithub HTTP calls don't block the loop
     async def _fetch_and_chunk() -> dict:
         import asyncio as _aio
-        return await _aio.to_thread(fetch_and_chunk_repo, repo_slug, mode, event_id)  # positional OK
+        return await _aio.to_thread(fetch_and_chunk_repo, repo_slug, mode, event_id, tenant_id)
 
     chunks_data = await ctx.step.run("fetch-and-chunk", _fetch_and_chunk)
 
@@ -175,11 +186,13 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
     # internal event ID format.
     session_id: str = ctx.event.data.get("session_id") or ctx.event.id
     history: list[dict] = ctx.event.data.get("history", [])
+    tenant_id: str = ctx.event.data.get("tenant_id") or SHARED_TENANT
     run_start = time.time()
 
     # User-supplied overrides from the dashboard Settings page — fall back to env.
     set_github_token_override(ctx.event.data.get("github_token"))
     set_vllm_api_key_override(ctx.event.data.get("vllm_api_key"))
+    set_tenant_id_override(tenant_id)
 
     # Step: compress-history — always runs so Inngest replay order is stable.
     # Only makes an LLM call when total history chars exceed the threshold.
@@ -390,7 +403,9 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
         # as the context base for the next message in this conversation.
         "compressed_history": effective_history,
     }
-    _RESULT_CACHE[session_id] = result
+    # Stamp the tenant on the cached result so /api/result/{id} can refuse to
+    # serve another tenant's session_id if it gets guessed/leaked.
+    _RESULT_CACHE[session_id] = {"tenant_id": tenant_id, "result": result}
     return result
 
 
@@ -436,11 +451,24 @@ def _extract_user_vllm_key(request: Request) -> str | None:
     return key or None
 
 
+def _extract_tenant_id(request: Request) -> str:
+    """Per-request tenant ID (X-Tenant-Id). Falls back to ``SHARED_TENANT``.
+
+    Also applies validation + sets the ContextVar so any synchronous helpers
+    invoked inside the request handler see the same tenant the Inngest job will.
+    """
+    tid = (request.headers.get("X-Tenant-Id") or "").strip()
+    set_tenant_id_override(tid or None)
+    from auth import get_tenant_id
+    return get_tenant_id()
+
+
 @app.post("/api/ingest")
 async def trigger_ingest(req: IngestRequest, request: Request):
     """Trigger a background repo ingestion job."""
     if req.repo.count("/") != 1:
         raise HTTPException(status_code=400, detail="repo must be in 'owner/name' form")
+    tenant_id = _extract_tenant_id(request)
     await inngest_client.send(
         inngest.Event(
             name="repomind/ingest_repo",
@@ -449,6 +477,7 @@ async def trigger_ingest(req: IngestRequest, request: Request):
                 "mode": req.mode,
                 "github_token": _extract_user_github_token(request),
                 "vllm_api_key": _extract_user_vllm_key(request),
+                "tenant_id": tenant_id,
             },
         )
     )
@@ -458,15 +487,22 @@ async def trigger_ingest(req: IngestRequest, request: Request):
 @app.post("/api/query")
 async def trigger_query(req: QueryRequest, request: Request):
     """Trigger an agent run. Poll /api/result/{session_id} for the answer."""
+    tenant_id = _extract_tenant_id(request)
+    # Client sends the bare collection name (e.g. "0xnktd_fireranger_ast");
+    # qualify here so the agent's vector_search hits THIS tenant's collection
+    # only — even if the client tries to spoof another tenant's prefix.
+    bare_name = strip_tenant(req.collection_name)[1]
+    qualified = qualify_collection(bare_name, tenant_id)
     session_id = str(uuid.uuid4())
     await inngest_client.send(
         inngest.Event(
             name="repomind/run_agent",
             data={
                 "query": req.query,
-                "collection_name": req.collection_name,
+                "collection_name": qualified,
                 "github_token": _extract_user_github_token(request),
                 "vllm_api_key": _extract_user_vllm_key(request),
+                "tenant_id": tenant_id,
                 "session_id": session_id,
                 "history": req.history,
             },
@@ -476,26 +512,35 @@ async def trigger_query(req: QueryRequest, request: Request):
 
 
 @app.get("/api/result/{session_id}")
-async def get_result(session_id: str):
-    """Return cached agent result if ready, else 404."""
-    result = _RESULT_CACHE.get(session_id)
-    if result is None:
+async def get_result(session_id: str, request: Request):
+    """Return cached agent result if ready, else 404.
+
+    Refuses to serve a session that belongs to a different tenant — that way
+    a guessed/leaked UUID can't be used to read another tenant's answer.
+    """
+    tenant_id = _extract_tenant_id(request)
+    entry = _RESULT_CACHE.get(session_id)
+    if entry is None or entry.get("tenant_id") != tenant_id:
         raise HTTPException(status_code=404, detail="result not ready yet")
-    return result
+    return entry["result"]
 
 
 @app.get("/api/collections")
-async def list_collections():
-    """List all ChromaDB collections with chunk counts."""
+async def list_collections(request: Request):
+    """List THIS tenant's ChromaDB collections with chunk counts (bare names)."""
+    tenant_id = _extract_tenant_id(request)
     try:
         client = chromadb.PersistentClient(path=os.getenv("CHROMA_DB_PATH", "./chroma_db"))
         result = []
         for col in client.list_collections():
+            if not belongs_to(col.name, tenant_id):
+                continue
+            _, bare = strip_tenant(col.name)
             try:
                 count = client.get_collection(col.name).count()
             except Exception:
                 count = 0
-            result.append({"name": col.name, "chunk_count": count})
+            result.append({"name": bare, "chunk_count": count})
         return {"collections": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -504,6 +549,7 @@ async def list_collections():
 @app.get("/api/collections/{name}/chunks")
 async def list_chunks(
     name: str,
+    request: Request,
     limit: int = 50,
     offset: int = 0,
     file_path: str | None = None,
@@ -531,12 +577,18 @@ async def list_chunks(
     if offset < 0:
         raise HTTPException(status_code=400, detail="offset must be >= 0")
 
+    tenant_id = _extract_tenant_id(request)
+    # Accept either the bare name or an already-qualified name from the client;
+    # always look up under the requesting tenant. Strips any spoofed prefix.
+    bare_name = strip_tenant(name)[1]
+    qualified = qualify_collection(bare_name, tenant_id)
+
     try:
         client = chromadb.PersistentClient(path=os.getenv("CHROMA_DB_PATH", "./chroma_db"))
         try:
-            collection = client.get_collection(name)
+            collection = client.get_collection(qualified)
         except Exception:
-            raise HTTPException(status_code=404, detail=f"collection '{name}' not found")
+            raise HTTPException(status_code=404, detail=f"collection '{bare_name}' not found")
 
         # Build the where filter — ChromaDB needs $and for >1 condition.
         filters: list[dict] = []
@@ -575,7 +627,7 @@ async def list_chunks(
         ]
 
         return {
-            "collection_name": name,
+            "collection_name": bare_name,
             "chunks": chunks,
             "total": total,
             "limit": limit,
@@ -588,28 +640,31 @@ async def list_chunks(
 
 
 @app.get("/api/logs")
-async def recent_logs(limit: int = 50):
-    """Return the most recent agent log entries."""
+async def recent_logs(request: Request, limit: int = 50):
+    """Return the most recent agent log entries scoped to this tenant."""
+    tenant_id = _extract_tenant_id(request)
     try:
-        return {"logs": get_recent_logs(limit)}
+        return {"logs": get_recent_logs(limit, tenant_id=tenant_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/logs/{session_id}")
-async def session_logs(session_id: str):
-    """Return all log entries for a specific session."""
+async def session_logs(session_id: str, request: Request):
+    """Return all log entries for a specific session, scoped to this tenant."""
+    tenant_id = _extract_tenant_id(request)
     try:
-        return {"logs": get_session_logs(session_id)}
+        return {"logs": get_session_logs(session_id, tenant_id=tenant_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/metrics")
-async def aggregate_metrics():
-    """Return aggregate metrics across all sessions."""
+async def aggregate_metrics(request: Request):
+    """Return aggregate metrics across this tenant's sessions."""
+    tenant_id = _extract_tenant_id(request)
     try:
-        metrics = compute_aggregate_metrics()
+        metrics = compute_aggregate_metrics(tenant_id=tenant_id)
         return metrics or {}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
