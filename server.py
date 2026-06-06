@@ -27,12 +27,14 @@ Inngest Dev UI is available at http://localhost:8288
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 
 import inngest
 import inngest.fast_api
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import chromadb
@@ -385,6 +387,19 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
 # ─── FastAPI app ─────────────────────────────────────────────────────────────
 
 app = FastAPI(title="repomind server")
+
+# CORS — let the deployed frontend (Vercel) call this backend cross-origin.
+# CORS_ORIGINS is a comma-separated list, e.g. "https://repomind.vercel.app,https://repomind-foo.vercel.app".
+# Default "*" is permissive for local/dev; set explicitly in production.
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins or ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 inngest.fast_api.serve(app, inngest_client, [ingest_repo_fn, run_agent_fn])
 
 
@@ -444,7 +459,7 @@ async def get_result(session_id: str):
 async def list_collections():
     """List all ChromaDB collections with chunk counts."""
     try:
-        client = chromadb.PersistentClient(path="./chroma_db")
+        client = chromadb.PersistentClient(path=os.getenv("CHROMA_DB_PATH", "./chroma_db"))
         result = []
         for col in client.list_collections():
             try:

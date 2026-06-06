@@ -72,7 +72,7 @@ with st.sidebar:
     st.divider()
 
     try:
-        client = chromadb.PersistentClient(path="./chroma_db")
+        client = chromadb.PersistentClient(path=os.getenv("CHROMA_DB_PATH", "./chroma_db"))
         collections = [c.name for c in client.list_collections()]
     except Exception:
         collections = []

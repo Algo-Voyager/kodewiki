@@ -24,7 +24,7 @@ from github import Auth, Github
 
 load_dotenv()
 
-CHROMA_PATH = "./chroma_db"
+CHROMA_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 
 _embed_client = openai.OpenAI(

@@ -421,7 +421,7 @@ def fetch_and_chunk_repo(repo_slug: str, mode: str, event_id: str = "cli") -> di
 
     collection_name = f"{owner}_{name}_{mode}"
     safe_event_id = event_id.replace("/", "-")[:40]
-    temp_path = str(Path("./chroma_db") / f".chunks_{collection_name}_{safe_event_id}.jsonl")
+    temp_path = str(Path(os.getenv("CHROMA_DB_PATH", "./chroma_db")) / f".chunks_{collection_name}_{safe_event_id}.jsonl")
     Path(temp_path).parent.mkdir(parents=True, exist_ok=True)
 
     files_seen = 0
@@ -466,7 +466,7 @@ def embed_and_store_chunks(chunks_data: dict) -> dict:
     collection_name: str = chunks_data["collection_name"]
     temp_path: str = chunks_data["temp_path"]
 
-    client = chromadb.PersistentClient(path="./chroma_db")
+    client = chromadb.PersistentClient(path=os.getenv("CHROMA_DB_PATH", "./chroma_db"))
     collection = client.get_or_create_collection(collection_name)
 
     total = 0

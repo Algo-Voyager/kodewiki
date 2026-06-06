@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 EMBED_MODEL   = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
-CHROMA_PATH   = "./chroma_db"
+CHROMA_PATH   = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 OUTPUT_PATH   = Path("frontend/public/benchmark_results.json")
 
 QWEN_GENERATE_URL = os.getenv("QWEN_GENERATE_URL", "")

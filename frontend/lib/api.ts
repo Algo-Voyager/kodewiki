@@ -1,4 +1,7 @@
-const BASE = "/api";
+// Local dev: BASE = "/api" → next.config.ts rewrites to http://localhost:8000.
+// Production (Vercel): set NEXT_PUBLIC_API_URL=https://<render-app>.onrender.com/api
+// to call the Render backend directly. CORS middleware on the backend allows it.
+const BASE = process.env.NEXT_PUBLIC_API_URL ?? "/api";
 
 export interface Collection {
   name: string;

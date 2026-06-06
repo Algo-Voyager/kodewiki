@@ -20,11 +20,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import textwrap
 
 import chromadb
 
-CHROMA_PATH = "./chroma_db"
+CHROMA_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 SEP = "─" * 72
 
 
