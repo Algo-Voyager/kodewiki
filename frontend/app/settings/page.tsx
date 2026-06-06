@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { CheckCircle2, Eye, EyeOff, Github, Save, Trash2 } from "lucide-react";
+import { CheckCircle2, Eye, EyeOff, KeyRound, Save, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { getStoredGithubToken, setStoredGithubToken } from "@/lib/api";
@@ -56,7 +56,7 @@ export default function SettingsPage() {
       <section className="rounded-xl border border-border bg-card p-6 space-y-4">
         <div className="flex items-center gap-3">
           <div className="rounded-lg bg-amber-500/15 border border-amber-500/30 p-2">
-            <Github className="h-5 w-5 text-amber-400" />
+            <KeyRound className="h-5 w-5 text-amber-400" />
           </div>
           <div>
             <h2 className="text-base font-semibold text-foreground">
