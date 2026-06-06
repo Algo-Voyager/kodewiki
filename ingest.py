@@ -141,6 +141,17 @@ def _sub_chunk(text: str, base_id: str, base_meta: dict, header: str = "") -> li
     return chunks
 
 
+def _effective_start_line(node: ast.AST) -> int:
+    """First line owned by a function/class — earliest decorator if any, else node.lineno.
+    Without this, `@decorator` lines fall into neither the function chunk nor the
+    preceding module-level run, dropping context like `@app.route(...)` / `@st.cache_resource`.
+    """
+    decorators = getattr(node, "decorator_list", None)
+    if decorators:
+        return decorators[0].lineno
+    return node.lineno
+
+
 def _ast_function_chunks(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     lines: list[str],
@@ -149,14 +160,15 @@ def _ast_function_chunks(
     """One chunk per function/method; sub-chunks if the body exceeds CHUNK_CHARS."""
     if node.end_lineno is None:
         return []
-    text = "\n".join(lines[node.lineno - 1 : node.end_lineno])
+    start = _effective_start_line(node)
+    text = "\n".join(lines[start - 1 : node.end_lineno])
     docstring = ast.get_docstring(node) or ""
-    base_id = f"{file_path}::function::{node.name}::{node.lineno}"
+    base_id = f"{file_path}::function::{node.name}::{start}"
     base_meta: dict = {
         "type": "function",
         "name": node.name,
         "file_path": file_path,
-        "line_start": node.lineno,
+        "line_start": start,
         "line_end": node.end_lineno,
         "docstring": docstring,
         "language": "python",
@@ -174,9 +186,9 @@ def _ast_function_chunks(
             header_end = first_stmt.end_lineno or first_stmt.lineno
         else:
             header_end = first_stmt.lineno - 1
-        header = "\n".join(lines[node.lineno - 1 : header_end]) + "\n"
+        header = "\n".join(lines[start - 1 : header_end]) + "\n"
     else:
-        header = lines[node.lineno - 1] + "\n"
+        header = lines[start - 1] + "\n"
 
     return _sub_chunk(text, base_id, base_meta, header=header)
 
@@ -187,31 +199,33 @@ def _ast_class_header_chunk(node: ast.ClassDef, lines: list[str], file_path: str
     This prevents the same code appearing in both the class chunk and the
     method chunk (the duplication the old ast.walk approach caused).
     """
+    start = _effective_start_line(node)
     # Find where the first method starts so we can trim before it.
     first_method_line: int | None = None
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if first_method_line is None or child.lineno < first_method_line:
-                first_method_line = child.lineno
+            child_start = _effective_start_line(child)
+            if first_method_line is None or child_start < first_method_line:
+                first_method_line = child_start
 
     if first_method_line is not None:
-        header = lines[node.lineno - 1 : first_method_line - 1]
+        header = lines[start - 1 : first_method_line - 1]
         while header and not header[-1].strip():
             header.pop()
-        text = "\n".join(header) if header else "\n".join(lines[node.lineno - 1 : node.end_lineno])
+        text = "\n".join(header) if header else "\n".join(lines[start - 1 : node.end_lineno])
     else:
         # No methods — use the full class body.
-        text = "\n".join(lines[node.lineno - 1 : node.end_lineno])
+        text = "\n".join(lines[start - 1 : node.end_lineno])
 
     docstring = ast.get_docstring(node) or ""
     return Chunk(
-        chunk_id=f"{file_path}::class::{node.name}::{node.lineno}",
+        chunk_id=f"{file_path}::class::{node.name}::{start}",
         text=text,
         metadata={
             "type": "class",
             "name": node.name,
             "file_path": file_path,
-            "line_start": node.lineno,
+            "line_start": start,
             "line_end": node.end_lineno,
             "docstring": docstring,
             "language": "python",
@@ -228,20 +242,60 @@ def extract_python_ast_chunks(source: str, file_path: str) -> list[Chunk]:
     lines = source.splitlines()
     chunks: list[Chunk] = []
 
+    # Accumulator for contiguous module-level statements (imports, top-level
+    # assignments, top-level Streamlit/Flask/CLI calls). Without this we silently
+    # dropped everything that wasn't a top-level FunctionDef/ClassDef — fatal for
+    # script-style files where the actual logic lives at module level.
+    module_run_start: int | None = None
+    module_run_end: int | None = None
+    module_idx = 0
+
+    def flush_module() -> None:
+        nonlocal module_run_start, module_run_end, module_idx
+        if module_run_start is None or module_run_end is None:
+            return
+        text = "\n".join(lines[module_run_start - 1 : module_run_end]).rstrip()
+        if text.strip():
+            base_id = f"{file_path}::code::module::{module_idx}::{module_run_start}"
+            base_meta = {
+                "type": "code",
+                "file_path": file_path,
+                "line_start": module_run_start,
+                "line_end": module_run_end,
+                "language": "python",
+                "chunk_index": module_idx,
+            }
+            if len(text) <= CHUNK_CHARS:
+                chunks.append(Chunk(chunk_id=base_id, text=text, metadata=base_meta))
+            else:
+                chunks.extend(_sub_chunk(text, base_id, base_meta, header=""))
+            module_idx += 1
+        module_run_start = None
+        module_run_end = None
+
     # Iterate only over top-level module statements (not ast.walk which would
     # visit nested nodes and cause method bodies to appear in both the class
     # chunk and the individual method chunks).
     for node in ast.iter_child_nodes(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            chunks.extend(_ast_function_chunks(node, lines, file_path))
-        elif isinstance(node, ast.ClassDef):
-            if node.end_lineno is None:
-                continue
-            chunks.append(_ast_class_header_chunk(node, lines, file_path))
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    chunks.extend(_ast_function_chunks(child, lines, file_path))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            flush_module()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                chunks.extend(_ast_function_chunks(node, lines, file_path))
+            else:  # ClassDef
+                if node.end_lineno is None:
+                    continue
+                chunks.append(_ast_class_header_chunk(node, lines, file_path))
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        chunks.extend(_ast_function_chunks(child, lines, file_path))
+        else:
+            stmt_start = node.lineno
+            stmt_end = getattr(node, "end_lineno", None) or node.lineno
+            if module_run_start is None:
+                module_run_start = stmt_start
+            module_run_end = stmt_end
 
+    flush_module()
     return chunks
 
 
