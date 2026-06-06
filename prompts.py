@@ -50,6 +50,14 @@ Rules:
     flowchart TD      → step-by-step flows, pipelines, data paths
     sequenceDiagram   → request/response or call flows between components
     classDiagram      → class structures and relationships
+  flowchart rules (STRICT — violations cause a "Syntax error in text" render):
+    - ALWAYS wrap node labels in double quotes if they contain ANY of these chars:
+      . ( ) # ' , : | / @ ! ? & = + * < > [ ] {{ }}
+      Right: A["myapp.py (load_model)"]   Wrong: A[myapp.py (load_model)]
+      Right: B["keras.models.load_model()"]   Wrong: B[keras.models.load_model()]
+      Right: C["Loads 'final_model2.h5'"]   Wrong: C[Loads 'final_model2.h5']
+    - Plain alphanumeric / single-word labels need NO quotes: A[Setup] is fine.
+    - Edge labels with special chars also need quoting: A -->|"calls .render()"| B
   classDiagram rules (STRICT — violations cause a parse error):
     - NEVER use curly braces inside member lines. Write +method() not +method({{key}})
     - Omit parameter types: write +build(context) not +build(BuildContext context)
