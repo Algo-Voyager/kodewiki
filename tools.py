@@ -27,10 +27,16 @@ load_dotenv()
 CHROMA_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 
-_embed_client = openai.OpenAI(
-    base_url=os.getenv("EMBED_BASE_URL"),
-    api_key=os.getenv("VLLM_API_KEY", ""),
-)
+def _make_embed_client() -> openai.OpenAI:
+    """Build a fresh embeddings client per call so the dashboard's X-VLLM-Key
+    override (set by the Inngest handler via auth.set_vllm_api_key_override) is
+    actually used. openai.OpenAI freezes its key at construction, so caching the
+    client at module-import would lock out the override."""
+    from auth import get_vllm_api_key
+    return openai.OpenAI(
+        base_url=os.getenv("EMBED_BASE_URL"),
+        api_key=get_vllm_api_key(),
+    )
 MAX_FILE_CHARS = 3000
 VALID_FILTER_TYPES = {"function", "class", "doc", "code"}
 
@@ -62,7 +68,7 @@ def _get_repo(collection_name: str):
 
 def _embed(text: str) -> list[float]:
     t0 = time.time()
-    resp = _embed_client.embeddings.create(input=[text], model=EMBED_MODEL)
+    resp = _make_embed_client().embeddings.create(input=[text], model=EMBED_MODEL)
     _TOOL_METRICS.set({**_TOOL_METRICS.get({}), "embed_ms": round((time.time() - t0) * 1000)})
     return resp.data[0].embedding
 

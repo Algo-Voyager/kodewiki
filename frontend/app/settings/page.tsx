@@ -1,10 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { CheckCircle2, Eye, EyeOff, KeyRound, Save, Trash2 } from "lucide-react";
+import { CheckCircle2, Cpu, Eye, EyeOff, KeyRound, Save, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { getStoredGithubToken, setStoredGithubToken } from "@/lib/api";
+import {
+  getStoredGithubToken,
+  setStoredGithubToken,
+  getStoredVllmApiKey,
+  setStoredVllmApiKey,
+} from "@/lib/api";
 
 /**
  * Settings page — currently just the GitHub PAT override.
@@ -21,9 +26,14 @@ export default function SettingsPage() {
   const [reveal, setReveal] = useState(false);
   const [saved, setSaved] = useState<"idle" | "saved" | "cleared">("idle");
 
-  // Hydrate the input from localStorage on mount.
+  const [vllmKey, setVllmKey] = useState("");
+  const [revealVllm, setRevealVllm] = useState(false);
+  const [savedVllm, setSavedVllm] = useState<"idle" | "saved" | "cleared">("idle");
+
+  // Hydrate inputs from localStorage on mount.
   useEffect(() => {
     setToken(getStoredGithubToken());
+    setVllmKey(getStoredVllmApiKey());
   }, []);
 
   const handleSave = () => {
@@ -39,7 +49,21 @@ export default function SettingsPage() {
     setTimeout(() => setSaved("idle"), 2500);
   };
 
+  const handleSaveVllm = () => {
+    setStoredVllmApiKey(vllmKey);
+    setSavedVllm(vllmKey.trim() ? "saved" : "cleared");
+    setTimeout(() => setSavedVllm("idle"), 2500);
+  };
+
+  const handleClearVllm = () => {
+    setVllmKey("");
+    setStoredVllmApiKey("");
+    setSavedVllm("cleared");
+    setTimeout(() => setSavedVllm("idle"), 2500);
+  };
+
   const masked = token && !reveal ? "•".repeat(Math.min(token.length, 36)) : token;
+  const maskedVllm = vllmKey && !revealVllm ? "•".repeat(Math.min(vllmKey.length, 36)) : vllmKey;
 
   return (
     <div className="mx-auto max-w-2xl py-10 px-6 space-y-8">
@@ -124,6 +148,79 @@ export default function SettingsPage() {
             </span>
           )}
           {saved === "cleared" && (
+            <span className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
+              <CheckCircle2 className="h-4 w-4" />
+              Cleared — falling back to the server&apos;s default.
+            </span>
+          )}
+        </div>
+      </section>
+
+      {/* ─── LLM / VLLM API Key ─────────────────────────────────────────── */}
+      <section className="rounded-xl border border-border bg-card p-6 space-y-4">
+        <div className="flex items-center gap-3">
+          <div className="rounded-lg bg-sky-500/15 border border-sky-500/30 p-2">
+            <Cpu className="h-5 w-5 text-sky-400" />
+          </div>
+          <div>
+            <h2 className="text-base font-semibold text-foreground">
+              LLM API Key <span className="text-xs font-normal text-muted-foreground">(Modal / vLLM Bearer)</span>
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              Auth key for the Qwen + embedding endpoints. Use your own Modal key
+              if the deploy&apos;s default has rotated, or to point at your own
+              Modal deployment.
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+            API Key
+          </label>
+          <div className="flex gap-2">
+            <Input
+              type={revealVllm ? "text" : "password"}
+              value={revealVllm ? vllmKey : maskedVllm}
+              onChange={(e) => setVllmKey(e.target.value)}
+              placeholder="Bearer key from your Modal app's secret"
+              className="font-mono text-sm flex-1"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={() => setRevealVllm((v) => !v)}
+              title={revealVllm ? "Hide key" : "Reveal key"}
+            >
+              {revealVllm ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </Button>
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Sent as <code className="px-1 rounded bg-muted">X-VLLM-Key</code>.
+            Backend uses it as the <code className="px-1 rounded bg-muted">Authorization: Bearer</code>{" "}
+            for both Qwen generation and embedding calls.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 pt-2">
+          <Button onClick={handleSaveVllm} className="bg-sky-500 hover:bg-sky-600 text-white">
+            <Save className="h-4 w-4 mr-2" />
+            Save
+          </Button>
+          <Button onClick={handleClearVllm} variant="outline" disabled={!vllmKey}>
+            <Trash2 className="h-4 w-4 mr-2" />
+            Clear
+          </Button>
+          {savedVllm === "saved" && (
+            <span className="ml-2 inline-flex items-center gap-1 text-xs text-emerald-400">
+              <CheckCircle2 className="h-4 w-4" />
+              Saved — next LLM/embedding call uses this key.
+            </span>
+          )}
+          {savedVllm === "cleared" && (
             <span className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
               <CheckCircle2 className="h-4 w-4" />
               Cleared — falling back to the server&apos;s default.

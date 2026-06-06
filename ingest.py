@@ -378,17 +378,15 @@ def fetch_file_bytes(gh: Github, entry: ContentFile) -> bytes | None:
             return None
 
 
-_embed_client: openai.OpenAI | None = None
-
-
 def _get_embed_client() -> openai.OpenAI:
-    global _embed_client
-    if _embed_client is None:
-        _embed_client = openai.OpenAI(
-            base_url=os.getenv("EMBED_BASE_URL"),
-            api_key=os.getenv("VLLM_API_KEY", ""),
-        )
-    return _embed_client
+    """Build a fresh client per call. We can't cache — the dashboard's
+    X-VLLM-Key override is per-request, so the api_key must be re-read each
+    time (openai.OpenAI freezes its key at construction)."""
+    from auth import get_vllm_api_key
+    return openai.OpenAI(
+        base_url=os.getenv("EMBED_BASE_URL"),
+        api_key=get_vllm_api_key(),
+    )
 
 
 def embed(text: str) -> list[float]:

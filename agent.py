@@ -32,16 +32,18 @@ from tools import _TOOL_METRICS, run_tool
 load_dotenv()
 
 QWEN_GENERATE_URL = os.getenv("QWEN_GENERATE_URL", "")
-VLLM_API_KEY = os.getenv("VLLM_API_KEY", "")
 
 
 def _generate(prompt: str, max_new_tokens: int = 512, temperature: float = 0.2) -> str:
+    # Read the key per-call so the dashboard's X-VLLM-Key override (stashed in
+    # auth.set_vllm_api_key_override at the Inngest handler) takes effect.
+    from auth import get_vllm_api_key
     resp = httpx.post(
         QWEN_GENERATE_URL,
         json={"prompt": prompt, "max_new_tokens": max_new_tokens, "temperature": temperature},
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {VLLM_API_KEY}",
+            "Authorization": f"Bearer {get_vllm_api_key()}",
         },
         timeout=120.0,
     )

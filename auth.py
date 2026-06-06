@@ -18,6 +18,13 @@ _github_token_override: contextvars.ContextVar[str | None] = contextvars.Context
     "github_token_override", default=None
 )
 
+# Same override pattern for the LLM / embeddings auth key (Modal Bearer).
+# Settings UI lets a user paste their own VLLM_API_KEY in case the deploy's
+# default is wrong / rotated / they're pointing at their own Modal app.
+_vllm_api_key_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "vllm_api_key_override", default=None
+)
+
 
 def set_github_token_override(token: str | None) -> None:
     """Set the per-context PAT override. Pass None or "" to clear."""
@@ -40,3 +47,20 @@ def get_github_token() -> str:
             "into the dashboard's Settings page (sent as X-Github-Token header)."
         )
     return token
+
+
+def set_vllm_api_key_override(key: str | None) -> None:
+    """Per-context LLM/embeddings key override. Pass None or "" to clear."""
+    _vllm_api_key_override.set(key.strip() if key and key.strip() else None)
+
+
+def get_vllm_api_key() -> str:
+    """Return the effective Modal / vLLM Bearer key — override first, env second.
+
+    Returns "" if neither is set (downstream HTTP calls then fail with 401 from
+    Modal; callers can choose to validate up-front if they want a nicer error).
+    """
+    key = _vllm_api_key_override.get()
+    if key:
+        return key
+    return os.getenv("VLLM_API_KEY", "")

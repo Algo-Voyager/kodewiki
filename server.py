@@ -39,7 +39,7 @@ from pydantic import BaseModel
 
 import chromadb
 
-from auth import set_github_token_override
+from auth import set_github_token_override, set_vllm_api_key_override
 from eval.metrics import compute_aggregate_metrics
 from ingest import embed_and_store_chunks, fetch_and_chunk_repo
 from inngest_setup import inngest_client
@@ -91,8 +91,10 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
     mode: str = ctx.event.data.get("mode", "ast")
     event_id: str = ctx.event.id
 
-    # User-supplied PAT override (from dashboard Settings) — falls back to env.
+    # User-supplied overrides from the dashboard Settings page (X-* headers
+    # plumbed through Inngest event data). Each falls back to its env var.
     set_github_token_override(ctx.event.data.get("github_token"))
+    set_vllm_api_key_override(ctx.event.data.get("vllm_api_key"))
 
     # Step 1: fetch and chunk — async so PyGithub HTTP calls don't block the loop
     async def _fetch_and_chunk() -> dict:
@@ -175,8 +177,9 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
     history: list[dict] = ctx.event.data.get("history", [])
     run_start = time.time()
 
-    # User-supplied PAT override (from dashboard Settings) — falls back to env.
+    # User-supplied overrides from the dashboard Settings page — fall back to env.
     set_github_token_override(ctx.event.data.get("github_token"))
+    set_vllm_api_key_override(ctx.event.data.get("vllm_api_key"))
 
     # Step: compress-history — always runs so Inngest replay order is stable.
     # Only makes an LLM call when total history chars exceed the threshold.
@@ -427,6 +430,12 @@ def _extract_user_github_token(request: Request) -> str | None:
     return tok or None
 
 
+def _extract_user_vllm_key(request: Request) -> str | None:
+    """Per-request LLM/embeddings Bearer key override (X-VLLM-Key). None if absent."""
+    key = (request.headers.get("X-VLLM-Key") or "").strip()
+    return key or None
+
+
 @app.post("/api/ingest")
 async def trigger_ingest(req: IngestRequest, request: Request):
     """Trigger a background repo ingestion job."""
@@ -439,6 +448,7 @@ async def trigger_ingest(req: IngestRequest, request: Request):
                 "repo": req.repo,
                 "mode": req.mode,
                 "github_token": _extract_user_github_token(request),
+                "vllm_api_key": _extract_user_vllm_key(request),
             },
         )
     )
@@ -456,6 +466,7 @@ async def trigger_query(req: QueryRequest, request: Request):
                 "query": req.query,
                 "collection_name": req.collection_name,
                 "github_token": _extract_user_github_token(request),
+                "vllm_api_key": _extract_user_vllm_key(request),
                 "session_id": session_id,
                 "history": req.history,
             },

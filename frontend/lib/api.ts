@@ -10,37 +10,61 @@ const BASE = process.env.NEXT_PUBLIC_API_URL ?? "/api";
 // (configured on Render) when absent — i.e. no header sent ≠ broken request.
 export const USER_TOKENS_KEY = "repomind:user-tokens:v1";
 
-export function getStoredGithubToken(): string {
-  if (typeof window === "undefined") return "";
+type StoredTokens = {
+  github_token?: string;
+  vllm_api_key?: string;
+};
+
+function readTokens(): StoredTokens {
+  if (typeof window === "undefined") return {};
   try {
     const raw = window.localStorage.getItem(USER_TOKENS_KEY);
-    if (!raw) return "";
-    const parsed = JSON.parse(raw) as { github_token?: string };
-    return (parsed.github_token ?? "").trim();
+    if (!raw) return {};
+    return JSON.parse(raw) as StoredTokens;
   } catch {
-    return "";
+    return {};
   }
 }
 
-export function setStoredGithubToken(token: string): void {
+function writeTokens(t: StoredTokens): void {
   if (typeof window === "undefined") return;
   try {
-    if (token.trim()) {
-      window.localStorage.setItem(
-        USER_TOKENS_KEY,
-        JSON.stringify({ github_token: token.trim() }),
-      );
-    } else {
+    const cleaned: StoredTokens = {};
+    if (t.github_token?.trim())  cleaned.github_token  = t.github_token.trim();
+    if (t.vllm_api_key?.trim())  cleaned.vllm_api_key  = t.vllm_api_key.trim();
+    if (Object.keys(cleaned).length === 0) {
       window.localStorage.removeItem(USER_TOKENS_KEY);
+    } else {
+      window.localStorage.setItem(USER_TOKENS_KEY, JSON.stringify(cleaned));
     }
   } catch {
     /* private mode / quota — silent */
   }
 }
 
+export function getStoredGithubToken(): string {
+  return (readTokens().github_token ?? "").trim();
+}
+
+export function setStoredGithubToken(token: string): void {
+  writeTokens({ ...readTokens(), github_token: token });
+}
+
+export function getStoredVllmApiKey(): string {
+  return (readTokens().vllm_api_key ?? "").trim();
+}
+
+export function setStoredVllmApiKey(key: string): void {
+  writeTokens({ ...readTokens(), vllm_api_key: key });
+}
+
 function authHeaders(): Record<string, string> {
-  const t = getStoredGithubToken();
-  return t ? { "X-Github-Token": t } : {};
+  const headers: Record<string, string> = {};
+  const gh   = getStoredGithubToken();
+  const vllm = getStoredVllmApiKey();
+  if (gh)   headers["X-Github-Token"] = gh;
+  if (vllm) headers["X-VLLM-Key"]     = vllm;
+  return headers;
 }
 
 export interface Collection {
