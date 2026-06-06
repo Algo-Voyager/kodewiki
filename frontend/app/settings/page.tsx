@@ -11,6 +11,7 @@ import {
   KeyRound,
   RefreshCw,
   Save,
+  Sparkles,
   Trash2,
   Users,
 } from "lucide-react";
@@ -21,6 +22,16 @@ import {
   setStoredGithubToken,
   getStoredVllmApiKey,
   setStoredVllmApiKey,
+  getStoredLlmProvider,
+  setStoredLlmProvider,
+  getStoredLlmApiKey,
+  setStoredLlmApiKey,
+  getStoredLlmModel,
+  setStoredLlmModel,
+  LLM_PROVIDERS,
+  PROVIDER_LABEL,
+  PROVIDER_DEFAULT_MODEL,
+  type LlmProvider,
 } from "@/lib/api";
 import {
   getOrCreateTenantId,
@@ -51,11 +62,21 @@ export default function SettingsPage() {
   const [tenantInput, setTenantInput] = useState("");
   const [tenantStatus, setTenantStatus] = useState<"idle" | "copied" | "reset" | "imported" | "invalid">("idle");
 
+  // Text-generation provider override (Anthropic / OpenAI / Gemini / vllm).
+  const [provider, setProvider] = useState<LlmProvider>("vllm");
+  const [providerKey, setProviderKey] = useState("");
+  const [revealProvider, setRevealProvider] = useState(false);
+  const [providerModel, setProviderModel] = useState("");
+  const [savedProvider, setSavedProvider] = useState<"idle" | "saved" | "cleared">("idle");
+
   // Hydrate inputs from localStorage on mount.
   useEffect(() => {
     setToken(getStoredGithubToken());
     setVllmKey(getStoredVllmApiKey());
     setTenant(getOrCreateTenantId());
+    setProvider(getStoredLlmProvider());
+    setProviderKey(getStoredLlmApiKey());
+    setProviderModel(getStoredLlmModel());
   }, []);
 
   const handleSave = () => {
@@ -102,6 +123,26 @@ export default function SettingsPage() {
     setTimeout(() => setTenantStatus("idle"), 2500);
   };
 
+  const handleSaveProvider = () => {
+    setStoredLlmProvider(provider);
+    setStoredLlmApiKey(providerKey);
+    setStoredLlmModel(providerModel);
+    const cleared = provider === "vllm" && !providerKey.trim() && !providerModel.trim();
+    setSavedProvider(cleared ? "cleared" : "saved");
+    setTimeout(() => setSavedProvider("idle"), 2500);
+  };
+
+  const handleClearProvider = () => {
+    setProvider("vllm");
+    setProviderKey("");
+    setProviderModel("");
+    setStoredLlmProvider("vllm");
+    setStoredLlmApiKey("");
+    setStoredLlmModel("");
+    setSavedProvider("cleared");
+    setTimeout(() => setSavedProvider("idle"), 2500);
+  };
+
   const handleImportTenant = () => {
     const ok = setTenantId(tenantInput);
     if (!ok) {
@@ -117,6 +158,19 @@ export default function SettingsPage() {
 
   const masked = token && !reveal ? "•".repeat(Math.min(token.length, 36)) : token;
   const maskedVllm = vllmKey && !revealVllm ? "•".repeat(Math.min(vllmKey.length, 36)) : vllmKey;
+  const maskedProviderKey = providerKey && !revealProvider ? "•".repeat(Math.min(providerKey.length, 36)) : providerKey;
+  const providerKeyPlaceholder: Record<LlmProvider, string> = {
+    vllm: "(not needed — uses the Modal key below)",
+    anthropic: "sk-ant-…",
+    openai: "sk-…",
+    gemini: "AIza…",
+  };
+  const providerKeyDocsUrl: Record<LlmProvider, string> = {
+    vllm: "",
+    anthropic: "https://console.anthropic.com/settings/keys",
+    openai: "https://platform.openai.com/api-keys",
+    gemini: "https://aistudio.google.com/apikey",
+  };
 
   return (
     <div className="mx-auto max-w-2xl py-10 px-6 space-y-8">
@@ -209,7 +263,124 @@ export default function SettingsPage() {
         </div>
       </section>
 
-      {/* ─── LLM / VLLM API Key ─────────────────────────────────────────── */}
+      {/* ─── Text Generation provider ───────────────────────────────────── */}
+      <section className="rounded-xl border border-border bg-card p-6 space-y-4">
+        <div className="flex items-center gap-3">
+          <div className="rounded-lg bg-fuchsia-500/15 border border-fuchsia-500/30 p-2">
+            <Sparkles className="h-5 w-5 text-fuchsia-400" />
+          </div>
+          <div>
+            <h2 className="text-base font-semibold text-foreground">
+              Text Generation
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              Pick the LLM provider for agent answers. Embeddings always use the
+              deploy&apos;s Modal endpoint (configured below) — this only routes
+              text generation. Bring your own Anthropic / OpenAI / Gemini key, or
+              keep the bundled Qwen on Modal.
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+            Provider
+          </label>
+          <select
+            value={provider}
+            onChange={(e) => setProvider(e.target.value as LlmProvider)}
+            className="w-full h-9 px-3 rounded-md border border-border bg-background text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia-500/40 focus-visible:border-fuchsia-500/40"
+          >
+            {LLM_PROVIDERS.map((p) => (
+              <option key={p} value={p}>{PROVIDER_LABEL[p]}</option>
+            ))}
+          </select>
+        </div>
+
+        {provider !== "vllm" && (
+          <>
+            <div className="space-y-2">
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                API Key
+              </label>
+              <div className="flex gap-2">
+                <Input
+                  type={revealProvider ? "text" : "password"}
+                  value={revealProvider ? providerKey : maskedProviderKey}
+                  onChange={(e) => setProviderKey(e.target.value)}
+                  placeholder={providerKeyPlaceholder[provider]}
+                  className="font-mono text-sm flex-1"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={() => setRevealProvider((v) => !v)}
+                  title={revealProvider ? "Hide key" : "Reveal key"}
+                >
+                  {revealProvider ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </Button>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                Get a key at{" "}
+                <a
+                  href={providerKeyDocsUrl[provider]}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-sky-400 hover:underline"
+                >
+                  {providerKeyDocsUrl[provider].replace("https://", "")}
+                </a>
+                . Sent as <code className="px-1 rounded bg-muted">X-LLM-Key</code>.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                Model <span className="text-[10px] normal-case text-muted-foreground/70">(optional)</span>
+              </label>
+              <Input
+                value={providerModel}
+                onChange={(e) => setProviderModel(e.target.value)}
+                placeholder={`default: ${PROVIDER_DEFAULT_MODEL[provider]}`}
+                className="font-mono text-sm"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <p className="text-[11px] text-muted-foreground">
+                Override the default. Pick any model your key can access.
+              </p>
+            </div>
+          </>
+        )}
+
+        <div className="flex items-center gap-2 pt-2">
+          <Button onClick={handleSaveProvider} className="bg-fuchsia-500 hover:bg-fuchsia-600 text-white">
+            <Save className="h-4 w-4 mr-2" />
+            Save
+          </Button>
+          <Button onClick={handleClearProvider} variant="outline">
+            <Trash2 className="h-4 w-4 mr-2" />
+            Reset to default
+          </Button>
+          {savedProvider === "saved" && (
+            <span className="ml-2 inline-flex items-center gap-1 text-xs text-emerald-400">
+              <CheckCircle2 className="h-4 w-4" />
+              Saved — next query uses {PROVIDER_LABEL[provider].split(" — ")[0]}.
+            </span>
+          )}
+          {savedProvider === "cleared" && (
+            <span className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
+              <CheckCircle2 className="h-4 w-4" />
+              Reset — falling back to the bundled Modal Qwen.
+            </span>
+          )}
+        </div>
+      </section>
+
+      {/* ─── Modal / Embeddings key ─────────────────────────────────────── */}
       <section className="rounded-xl border border-border bg-card p-6 space-y-4">
         <div className="flex items-center gap-3">
           <div className="rounded-lg bg-sky-500/15 border border-sky-500/30 p-2">
@@ -217,12 +388,13 @@ export default function SettingsPage() {
           </div>
           <div>
             <h2 className="text-base font-semibold text-foreground">
-              LLM API Key <span className="text-xs font-normal text-muted-foreground">(Modal / vLLM Bearer)</span>
+              Modal / Embeddings Key <span className="text-xs font-normal text-muted-foreground">(Bearer)</span>
             </h2>
             <p className="text-xs text-muted-foreground">
-              Auth key for the Qwen + embedding endpoints. Use your own Modal key
-              if the deploy&apos;s default has rotated, or to point at your own
-              Modal deployment.
+              Used for the embeddings endpoint, and for text generation when the
+              provider above is set to <code className="px-1 rounded bg-muted">Modal (Qwen)</code>.
+              Paste your own key if the deploy&apos;s default has rotated or to
+              point at your own Modal deployment.
             </p>
           </div>
         </div>

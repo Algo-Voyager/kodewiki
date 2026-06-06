@@ -35,20 +35,126 @@ QWEN_GENERATE_URL = os.getenv("QWEN_GENERATE_URL", "")
 
 
 def _generate(prompt: str, max_new_tokens: int = 512, temperature: float = 0.2) -> str:
-    # Read the key per-call so the dashboard's X-VLLM-Key override (stashed in
-    # auth.set_vllm_api_key_override at the Inngest handler) takes effect.
-    from auth import get_vllm_api_key
+    """Provider-switching text generation.
+
+    Reads the active provider from auth (X-LLM-Provider header → ContextVar).
+    Supported: ``vllm`` (default, Modal Qwen) | ``anthropic`` | ``openai`` | ``gemini``.
+
+    Each non-vllm branch needs a key in ``auth.get_llm_api_key()`` (X-LLM-Key);
+    a missing key raises with a hint to set it in the dashboard's Settings page.
+    """
+    from auth import (
+        get_llm_api_key,
+        get_llm_model,
+        get_llm_provider,
+        get_vllm_api_key,
+    )
+    provider = get_llm_provider()
+    if provider == "vllm":
+        return _generate_vllm(prompt, max_new_tokens, temperature, get_vllm_api_key())
+    if provider == "anthropic":
+        return _generate_anthropic(prompt, max_new_tokens, temperature, get_llm_api_key(), get_llm_model(provider))
+    if provider == "openai":
+        return _generate_openai(prompt, max_new_tokens, temperature, get_llm_api_key(), get_llm_model(provider))
+    if provider == "gemini":
+        return _generate_gemini(prompt, max_new_tokens, temperature, get_llm_api_key(), get_llm_model(provider))
+    raise RuntimeError(f"Unknown LLM provider {provider!r}")
+
+
+def _require_key(provider: str, key: str) -> None:
+    if not key:
+        raise RuntimeError(
+            f"No API key for {provider}. Paste one in the dashboard's Settings → "
+            f"Text Generation card."
+        )
+
+
+def _generate_vllm(prompt: str, max_new_tokens: int, temperature: float, key: str) -> str:
+    """Original Modal/Qwen path — POSTs to the rag-learning generate endpoint."""
     resp = httpx.post(
         QWEN_GENERATE_URL,
         json={"prompt": prompt, "max_new_tokens": max_new_tokens, "temperature": temperature},
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {get_vllm_api_key()}",
+            "Authorization": f"Bearer {key}",
         },
         timeout=120.0,
     )
     resp.raise_for_status()
     return resp.json()["response"].strip()
+
+
+def _generate_anthropic(prompt: str, max_new_tokens: int, temperature: float, key: str, model: str) -> str:
+    """Anthropic Messages API. Concatenates ``text`` content blocks."""
+    _require_key("Anthropic", key)
+    resp = httpx.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": model,
+            "max_tokens": max_new_tokens,
+            "temperature": temperature,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=120.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return "".join(
+        block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
+    ).strip()
+
+
+def _generate_openai(prompt: str, max_new_tokens: int, temperature: float, key: str, model: str) -> str:
+    """OpenAI Chat Completions — also compatible with most ``OPENAI_BASE_URL`` clones."""
+    _require_key("OpenAI", key)
+    resp = httpx.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "max_tokens": max_new_tokens,
+            "temperature": temperature,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=120.0,
+    )
+    resp.raise_for_status()
+    return (resp.json()["choices"][0]["message"].get("content") or "").strip()
+
+
+def _generate_gemini(prompt: str, max_new_tokens: int, temperature: float, key: str, model: str) -> str:
+    """Google Gemini ``generateContent`` — key sent as ``x-goog-api-key`` header."""
+    _require_key("Gemini", key)
+    resp = httpx.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        headers={
+            "x-goog-api-key": key,
+            "Content-Type": "application/json",
+        },
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": max_new_tokens,
+                "temperature": temperature,
+            },
+        },
+        timeout=120.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return ""
+    parts = candidates[0].get("content", {}).get("parts", []) or []
+    return "".join(p.get("text", "") for p in parts).strip()
 
 
 def query_rewrite(user_query: str, history_context: str = "") -> str:

@@ -85,6 +85,75 @@ def get_vllm_api_key() -> str:
     return os.getenv("VLLM_API_KEY", "")
 
 
+# ─── LLM provider switching ─────────────────────────────────────────────────
+# Text generation can be routed through one of four providers per request.
+# Embeddings always use the Modal endpoint (see ingest.py / tools.py).
+#
+# Provider is selected by the X-LLM-Provider header (Settings → dropdown).
+# When unset, falls back to "vllm" (the deploy's bundled Modal Qwen endpoint).
+
+SUPPORTED_PROVIDERS = ("vllm", "anthropic", "openai", "gemini")
+
+# Sensible default model per provider — cheap + fast tiers. Override via the
+# X-LLM-Model header (Settings → model text input).
+DEFAULT_MODELS = {
+    "anthropic": "claude-haiku-4-5-20251001",
+    "openai":    "gpt-4o-mini",
+    "gemini":    "gemini-2.5-flash",
+}
+
+_llm_provider_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "llm_provider_override", default=None
+)
+_llm_api_key_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "llm_api_key_override", default=None
+)
+_llm_model_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "llm_model_override", default=None
+)
+
+
+def set_llm_provider_override(provider: str | None) -> None:
+    """Set the active text-generation provider. Unknown values clear the override."""
+    if not provider:
+        _llm_provider_override.set(None)
+        return
+    p = provider.strip().lower()
+    _llm_provider_override.set(p if p in SUPPORTED_PROVIDERS else None)
+
+
+def get_llm_provider() -> str:
+    """Return the active text-generation provider — override first, ``vllm`` otherwise."""
+    return _llm_provider_override.get() or "vllm"
+
+
+def set_llm_api_key_override(key: str | None) -> None:
+    """Set the API key for the active non-vllm provider (Anthropic / OpenAI / Gemini)."""
+    _llm_api_key_override.set(key.strip() if key and key.strip() else None)
+
+
+def get_llm_api_key() -> str:
+    """Provider-specific key for Anthropic / OpenAI / Gemini.
+
+    Returns "" if unset — caller should raise a helpful error pointing the user
+    to Settings before making the HTTP call.
+    """
+    return _llm_api_key_override.get() or ""
+
+
+def set_llm_model_override(model: str | None) -> None:
+    """Set the model name for the active provider. Pass None / "" to fall back to default."""
+    _llm_model_override.set(model.strip() if model and model.strip() else None)
+
+
+def get_llm_model(provider: str | None = None) -> str:
+    """Return the effective model name — override first, provider default otherwise."""
+    model = _llm_model_override.get()
+    if model:
+        return model
+    return DEFAULT_MODELS.get(provider or get_llm_provider(), "")
+
+
 # ─── Tenancy ────────────────────────────────────────────────────────────────
 
 def set_tenant_id_override(tenant_id: str | None) -> None:

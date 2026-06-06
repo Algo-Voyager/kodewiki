@@ -45,6 +45,9 @@ from auth import (
     belongs_to,
     qualify_collection,
     set_github_token_override,
+    set_llm_api_key_override,
+    set_llm_model_override,
+    set_llm_provider_override,
     set_tenant_id_override,
     set_vllm_api_key_override,
     strip_tenant,
@@ -131,6 +134,9 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
     # plumbed through Inngest event data). Each falls back to its env var.
     set_github_token_override(ctx.event.data.get("github_token"))
     set_vllm_api_key_override(ctx.event.data.get("vllm_api_key"))
+    set_llm_provider_override(ctx.event.data.get("llm_provider"))
+    set_llm_api_key_override(ctx.event.data.get("llm_api_key"))
+    set_llm_model_override(ctx.event.data.get("llm_model"))
     set_tenant_id_override(tenant_id)
 
     # Precompute the qualified collection name so the sidebar UI can poll for
@@ -259,6 +265,9 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
     # User-supplied overrides from the dashboard Settings page — fall back to env.
     set_github_token_override(ctx.event.data.get("github_token"))
     set_vllm_api_key_override(ctx.event.data.get("vllm_api_key"))
+    set_llm_provider_override(ctx.event.data.get("llm_provider"))
+    set_llm_api_key_override(ctx.event.data.get("llm_api_key"))
+    set_llm_model_override(ctx.event.data.get("llm_model"))
     set_tenant_id_override(tenant_id)
 
     # Step: compress-history — always runs so Inngest replay order is stable.
@@ -518,6 +527,25 @@ def _extract_user_vllm_key(request: Request) -> str | None:
     return key or None
 
 
+def _extract_llm_provider(request: Request) -> str | None:
+    """Selected text-generation provider (X-LLM-Provider). One of
+    ``anthropic`` / ``openai`` / ``gemini`` / ``vllm``. None falls back to ``vllm``."""
+    p = (request.headers.get("X-LLM-Provider") or "").strip().lower()
+    return p or None
+
+
+def _extract_llm_api_key(request: Request) -> str | None:
+    """Provider-specific API key (X-LLM-Key) for non-vllm providers. None if absent."""
+    k = (request.headers.get("X-LLM-Key") or "").strip()
+    return k or None
+
+
+def _extract_llm_model(request: Request) -> str | None:
+    """Optional model override (X-LLM-Model). None if absent → provider default."""
+    m = (request.headers.get("X-LLM-Model") or "").strip()
+    return m or None
+
+
 def _extract_tenant_id(request: Request) -> str:
     """Per-request tenant ID (X-Tenant-Id). Falls back to ``SHARED_TENANT``.
 
@@ -544,6 +572,9 @@ async def trigger_ingest(req: IngestRequest, request: Request):
                 "mode": req.mode,
                 "github_token": _extract_user_github_token(request),
                 "vllm_api_key": _extract_user_vllm_key(request),
+                "llm_provider": _extract_llm_provider(request),
+                "llm_api_key": _extract_llm_api_key(request),
+                "llm_model": _extract_llm_model(request),
                 "tenant_id": tenant_id,
             },
         )
@@ -569,6 +600,9 @@ async def trigger_query(req: QueryRequest, request: Request):
                 "collection_name": qualified,
                 "github_token": _extract_user_github_token(request),
                 "vllm_api_key": _extract_user_vllm_key(request),
+                "llm_provider": _extract_llm_provider(request),
+                "llm_api_key": _extract_llm_api_key(request),
+                "llm_model": _extract_llm_model(request),
                 "tenant_id": tenant_id,
                 "session_id": session_id,
                 "history": req.history,
