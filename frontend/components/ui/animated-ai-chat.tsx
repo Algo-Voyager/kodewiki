@@ -492,7 +492,7 @@ export function AnimatedAIChat() {
           >
             <div className="flex items-center gap-3">
               <div className="w-8 h-7 rounded-full bg-white/[0.05] flex items-center justify-center">
-                <span className="text-xs font-medium text-white/90">RM</span>
+                <span className="text-xs font-medium text-white/90">KW</span>
               </div>
               <div className="flex items-center gap-2 text-sm text-white/70">
                 <span>Thinking</span>

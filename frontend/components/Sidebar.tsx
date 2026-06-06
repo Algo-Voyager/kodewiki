@@ -173,9 +173,9 @@ export function Sidebar() {
           </div>
           <div>
             <h1 className="text-sm font-bold tracking-tight text-white leading-tight">
-              RepoMind
+              KodeWiki
             </h1>
-            <p className="text-[11px] text-white/40 leading-tight mt-0.5">Dev-Doc Agent</p>
+            <p className="text-[11px] text-white/40 leading-tight mt-0.5">Kevin Agent</p>
           </div>
         </div>
       </div>

@@ -32,7 +32,7 @@ const HINT_QUESTIONS = [
 function BotAvatar() {
   return (
     <div className="flex-shrink-0 w-7 h-7 rounded-full bg-sky-500/20 border border-sky-500/30 flex items-center justify-center text-xs font-bold text-sky-300">
-      RM
+      KW
     </div>
   );
 }
@@ -241,7 +241,7 @@ export default function ChatPage() {
           transition={{ duration: 0.5 }}
         >
           <div className="w-14 h-14 rounded-2xl bg-sky-500/10 border border-sky-500/20 flex items-center justify-center text-2xl font-bold text-sky-300 mx-auto">
-            RM
+            KW
           </div>
           <p className="text-base font-medium text-foreground">No repository selected</p>
           <p className="text-sm text-muted-foreground">
@@ -283,7 +283,7 @@ export default function ChatPage() {
               ? currentQueueCount > 0
                 ? `Processing · ${currentQueueCount} queued`
                 : "Processing…"
-              : "RepoMind agent"}
+              : "Kevin agent"}
           </p>
         </div>
       </motion.div>
@@ -383,7 +383,7 @@ export default function ChatPage() {
           >
             <div className="flex items-center gap-3">
               <div className="w-6 h-6 rounded-full bg-sky-500/20 border border-sky-500/30 flex items-center justify-center">
-                <span className="text-[10px] font-bold text-sky-300">RM</span>
+                <span className="text-[10px] font-bold text-sky-300">KW</span>
               </div>
               <div className="flex items-center gap-1.5 text-xs text-white/70">
                 <span>Thinking</span>

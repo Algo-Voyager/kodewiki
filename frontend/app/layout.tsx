@@ -11,8 +11,8 @@ const jakartaSans = Plus_Jakarta_Sans({
 });
 
 export const metadata: Metadata = {
-  title: "RepoMind",
-  description: "Developer documentation agent",
+  title: "KodeWiki",
+  description: "Kevin — your developer documentation agent",
 };
 
 export default function RootLayout({
