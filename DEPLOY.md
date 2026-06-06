@@ -51,7 +51,7 @@ The local `.env` stays put (gitignored).
 ## Step 2 — Backend on Render
 
 1. Open https://dashboard.render.com → **New +** → **Blueprint**.
-2. Connect your GitHub account (if not already done) → pick the **`Algo-Voyager/repomind`** repo.
+2. Connect your GitHub account (if not already done) → pick the **`Algo-Voyager/kodewiki`** repo.
 3. Render detects `render.yaml` and shows the service config.
 4. Click **Apply**.
 5. On the next page, Render prompts for the missing env vars. Paste these values from your local `.env` (and Inngest Cloud / Modal dashboards):
@@ -83,7 +83,7 @@ If you get a 502 / 503: the free tier was asleep — wait ~30 s and retry.
 
 ## Step 3 — Frontend on Vercel
 
-1. Open https://vercel.com/new → **Import Git Repository** → pick **`Algo-Voyager/repomind`**.
+1. Open https://vercel.com/new → **Import Git Repository** → pick **`Algo-Voyager/kodewiki`**.
 2. **Important — set Root Directory** to `frontend` (Vercel needs to see `package.json` at the root of the deploy).
 3. Framework Preset: **Next.js** (auto-detected).
 4. **Environment Variables** — click **Add** and paste:
@@ -117,7 +117,7 @@ If you get a 502 / 503: the free tier was asleep — wait ~30 s and retry.
 ## Step 5 — Smoke test the live app
 
 1. Open your Vercel URL.
-2. In the sidebar, enter `Algo-Voyager/repomind` and click **Ingest Repo**.
+2. In the sidebar, enter `Algo-Voyager/kodewiki` and click **Ingest Repo**.
 3. The Inngest Functions tab will show the `ingest_repo` job firing and stepping through. Takes ~30–90 s for a small repo.
 4. Once ingestion completes, the repo appears in the sidebar list.
 5. Select it and ask: *"How does the agent decide which tool to call?"*
