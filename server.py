@@ -472,6 +472,92 @@ async def list_collections():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/collections/{name}/chunks")
+async def list_chunks(
+    name: str,
+    limit: int = 50,
+    offset: int = 0,
+    file_path: str | None = None,
+    chunk_type: str | None = None,
+):
+    """Inspect raw chunks stored in a ChromaDB collection.
+
+    Useful for debugging the chunker (AST vs naive output) against the live
+    deployed instance — no need to re-ingest locally.
+
+    Query params:
+      limit       — page size (default 50, max 500)
+      offset      — pagination offset (default 0)
+      file_path   — filter to chunks from this file (exact match)
+      chunk_type  — filter by metadata.chunk_type (function | class | doc | code)
+
+    Returns:
+      {
+        collection_name, chunks: [{id, text, metadata}, ...],
+        total, limit, offset
+      }
+    """
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+
+    try:
+        client = chromadb.PersistentClient(path=os.getenv("CHROMA_DB_PATH", "./chroma_db"))
+        try:
+            collection = client.get_collection(name)
+        except Exception:
+            raise HTTPException(status_code=404, detail=f"collection '{name}' not found")
+
+        # Build the where filter — ChromaDB needs $and for >1 condition.
+        filters: list[dict] = []
+        if file_path:
+            filters.append({"file_path": file_path})
+        if chunk_type:
+            filters.append({"chunk_type": chunk_type})
+        where: dict | None = None
+        if len(filters) == 1:
+            where = filters[0]
+        elif len(filters) > 1:
+            where = {"$and": filters}
+
+        page = collection.get(
+            limit=limit,
+            offset=offset,
+            where=where,
+            include=["documents", "metadatas"],
+        )
+
+        # Total — fast path uses collection.count() when there's no filter;
+        # with a filter, fetch all matching IDs (cheap; only IDs, not data).
+        if where:
+            all_matches = collection.get(where=where, include=["metadatas"])
+            total = len(all_matches.get("ids") or [])
+        else:
+            total = collection.count()
+
+        chunks = [
+            {"id": cid, "text": doc, "metadata": meta or {}}
+            for cid, doc, meta in zip(
+                page.get("ids") or [],
+                page.get("documents") or [],
+                page.get("metadatas") or [],
+            )
+        ]
+
+        return {
+            "collection_name": name,
+            "chunks": chunks,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/logs")
 async def recent_logs(limit: int = 50):
     """Return the most recent agent log entries."""
