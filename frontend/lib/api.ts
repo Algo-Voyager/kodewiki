@@ -12,21 +12,37 @@ const BASE = process.env.NEXT_PUBLIC_API_URL ?? "/api";
 // (configured on Render) when absent — i.e. no header sent ≠ broken request.
 export const USER_TOKENS_KEY = "repomind:user-tokens:v1";
 
-export const LLM_PROVIDERS = ["vllm", "anthropic", "openai", "gemini"] as const;
+export const LLM_PROVIDERS = ["vllm", "openai", "gemini"] as const;
 export type LlmProvider = (typeof LLM_PROVIDERS)[number];
 
 export const PROVIDER_LABEL: Record<LlmProvider, string> = {
   vllm: "Modal (Qwen2.5-7B) — bundled default",
-  anthropic: "Anthropic Claude",
   openai: "OpenAI",
   gemini: "Google Gemini",
 };
 
 export const PROVIDER_DEFAULT_MODEL: Record<LlmProvider, string> = {
   vllm: "",
-  anthropic: "claude-haiku-4-5-20251001",
   openai: "gpt-4o-mini",
   gemini: "gemini-2.5-flash",
+};
+
+// Embedding provider — separate from text-gen because the choice has different
+// constraints (vector dimensions per provider). Anthropic isn't here because
+// Claude is chat-only and doesn't ship an embedding model.
+export const EMBED_PROVIDERS = ["vllm", "openai", "gemini"] as const;
+export type EmbedProvider = (typeof EMBED_PROVIDERS)[number];
+
+export const EMBED_PROVIDER_LABEL: Record<EmbedProvider, string> = {
+  vllm: "Modal (bge-small-en-v1.5, 384d) — bundled default",
+  openai: "OpenAI (text-embedding-3-small, 1536d)",
+  gemini: "Google Gemini (text-embedding-004, 768d)",
+};
+
+export const EMBED_PROVIDER_DEFAULT_MODEL: Record<EmbedProvider, string> = {
+  vllm: "",
+  openai: "text-embedding-3-small",
+  gemini: "text-embedding-004",
 };
 
 type StoredTokens = {
@@ -35,6 +51,9 @@ type StoredTokens = {
   llm_provider?: LlmProvider;
   llm_api_key?: string;
   llm_model?: string;
+  embed_provider?: EmbedProvider;
+  embed_api_key?: string;
+  embed_model?: string;
 };
 
 function readTokens(): StoredTokens {
@@ -57,6 +76,9 @@ function writeTokens(t: StoredTokens): void {
     if (t.llm_provider && LLM_PROVIDERS.includes(t.llm_provider)) cleaned.llm_provider = t.llm_provider;
     if (t.llm_api_key?.trim())   cleaned.llm_api_key   = t.llm_api_key.trim();
     if (t.llm_model?.trim())     cleaned.llm_model     = t.llm_model.trim();
+    if (t.embed_provider && EMBED_PROVIDERS.includes(t.embed_provider)) cleaned.embed_provider = t.embed_provider;
+    if (t.embed_api_key?.trim()) cleaned.embed_api_key = t.embed_api_key.trim();
+    if (t.embed_model?.trim())   cleaned.embed_model   = t.embed_model.trim();
     if (Object.keys(cleaned).length === 0) {
       window.localStorage.removeItem(USER_TOKENS_KEY);
     } else {
@@ -108,6 +130,31 @@ export function setStoredLlmModel(model: string): void {
   writeTokens({ ...readTokens(), llm_model: model });
 }
 
+export function getStoredEmbedProvider(): EmbedProvider {
+  const p = readTokens().embed_provider;
+  return p && EMBED_PROVIDERS.includes(p) ? p : "vllm";
+}
+
+export function setStoredEmbedProvider(provider: EmbedProvider): void {
+  writeTokens({ ...readTokens(), embed_provider: provider });
+}
+
+export function getStoredEmbedApiKey(): string {
+  return (readTokens().embed_api_key ?? "").trim();
+}
+
+export function setStoredEmbedApiKey(key: string): void {
+  writeTokens({ ...readTokens(), embed_api_key: key });
+}
+
+export function getStoredEmbedModel(): string {
+  return (readTokens().embed_model ?? "").trim();
+}
+
+export function setStoredEmbedModel(model: string): void {
+  writeTokens({ ...readTokens(), embed_model: model });
+}
+
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = {};
   const tenant = getOrCreateTenantId();
@@ -116,9 +163,9 @@ function authHeaders(): Record<string, string> {
   const vllm = getStoredVllmApiKey();
   if (gh)   headers["X-Github-Token"] = gh;
   if (vllm) headers["X-VLLM-Key"]     = vllm;
-  // Provider override (Settings → Text Generation card). When the user picks
-  // anthropic / openai / gemini we forward provider + key + (optional) model
-  // so the backend's _generate routes through that API instead of Modal Qwen.
+  // Text-gen override (Settings → Text Generation card). When the user picks
+  // openai / gemini we forward provider + key + (optional) model so the
+  // backend's _generate routes through that API instead of Modal Qwen.
   // For provider=vllm we skip these headers — backend defaults to vllm anyway.
   const provider = getStoredLlmProvider();
   if (provider !== "vllm") {
@@ -127,6 +174,18 @@ function authHeaders(): Record<string, string> {
     if (llmKey) headers["X-LLM-Key"] = llmKey;
     const llmModel = getStoredLlmModel();
     if (llmModel) headers["X-LLM-Model"] = llmModel;
+  }
+  // Embed-provider override (Settings → Embeddings card). Different provider
+  // = different vector dimension = a separate Chroma collection, so the
+  // backend always forwards this even when it matches vllm — so listing /
+  // qualify_collection can include it in the suffix.
+  const embedProvider = getStoredEmbedProvider();
+  headers["X-Embed-Provider"] = embedProvider;
+  if (embedProvider !== "vllm") {
+    const embedKey = getStoredEmbedApiKey();
+    if (embedKey) headers["X-Embed-Key"] = embedKey;
+    const embedModel = getStoredEmbedModel();
+    if (embedModel) headers["X-Embed-Model"] = embedModel;
   }
   return headers;
 }

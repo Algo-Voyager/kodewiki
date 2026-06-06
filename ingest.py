@@ -432,21 +432,70 @@ def fetch_file_bytes(gh: Github, entry: ContentFile) -> bytes | None:
             return None
 
 
-def _get_embed_client() -> openai.OpenAI:
-    """Build a fresh client per call. We can't cache — the dashboard's
-    X-VLLM-Key override is per-request, so the api_key must be re-read each
-    time (openai.OpenAI freezes its key at construction)."""
-    from auth import get_vllm_api_key
-    return openai.OpenAI(
-        base_url=os.getenv("EMBED_BASE_URL"),
-        api_key=get_vllm_api_key(),
-    )
-
-
 def embed(text: str) -> list[float]:
-    model = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
-    resp = _get_embed_client().embeddings.create(input=[text], model=model)
+    """Provider-switching single-text embedding.
+
+    Reads the active embed provider from auth (X-Embed-Provider header).
+    Supported: ``vllm`` (Modal bge-small) | ``openai`` | ``gemini``.
+
+    Each provider produces vectors of different dimension — switching providers
+    requires a fresh collection (the qualify_collection() name suffix handles
+    that automatically).
+    """
+    from auth import (
+        get_embed_api_key,
+        get_embed_model,
+        get_embed_provider,
+        get_vllm_api_key,
+    )
+    provider = get_embed_provider()
+    model = get_embed_model(provider)
+    if provider == "vllm":
+        return _embed_vllm(text, model, get_vllm_api_key())
+    if provider == "openai":
+        return _embed_openai(text, model, get_embed_api_key())
+    if provider == "gemini":
+        return _embed_gemini(text, model, get_embed_api_key())
+    raise RuntimeError(f"Unknown embedding provider {provider!r}")
+
+
+def _embed_vllm(text: str, model: str, key: str) -> list[float]:
+    """Original Modal-hosted bge-small (OpenAI-compatible /v1/embeddings)."""
+    client = openai.OpenAI(base_url=os.getenv("EMBED_BASE_URL"), api_key=key)
+    resp = client.embeddings.create(input=[text], model=model)
     return resp.data[0].embedding
+
+
+def _embed_openai(text: str, model: str, key: str) -> list[float]:
+    """OpenAI ``/v1/embeddings`` — uses the openai SDK with cloud base URL."""
+    if not key:
+        raise RuntimeError(
+            "No OpenAI API key. Paste one in the dashboard's Settings → Embeddings card."
+        )
+    client = openai.OpenAI(base_url="https://api.openai.com/v1", api_key=key)
+    resp = client.embeddings.create(input=[text], model=model)
+    return resp.data[0].embedding
+
+
+def _embed_gemini(text: str, model: str, key: str) -> list[float]:
+    """Google Gemini ``models/{model}:embedContent`` — different shape from OpenAI."""
+    if not key:
+        raise RuntimeError(
+            "No Gemini API key. Paste one in the dashboard's Settings → Embeddings card."
+        )
+    import httpx
+    resp = httpx.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent",
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+        json={
+            "model": f"models/{model}",
+            "content": {"parts": [{"text": text}]},
+        },
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["embedding"]["values"]
 
 
 def fetch_and_chunk_repo(
@@ -454,6 +503,7 @@ def fetch_and_chunk_repo(
     mode: str,
     event_id: str = "cli",
     tenant_id: str | None = None,
+    embed_provider: str | None = None,
 ) -> dict:
     """Step 1: Walk a GitHub repo, chunk every file, write to a temp JSONL on disk.
 
@@ -462,8 +512,10 @@ def fetch_and_chunk_repo(
     duplicate.
 
     *tenant_id* qualifies the collection name so two anonymous users ingesting
-    the same repo never collide. Omit to use the ContextVar default (CLI runs
-    fall back to ``SHARED_TENANT``).
+    the same repo never collide. *embed_provider* is appended as a second
+    suffix so ChromaDB collections stay separate per embedding model (which
+    have different vector dimensions). Both fall back to ContextVar defaults
+    when omitted (CLI runs become ``shared`` tenant + ``vllm`` provider).
 
     Returns a small dict (safe to serialise as an Inngest step result):
         {collection_name, temp_path, files_seen, total_chunks}
@@ -478,7 +530,9 @@ def fetch_and_chunk_repo(
     gh = Github(auth=Auth.Token(get_github_token()))
     repo = gh.get_repo(repo_slug)
 
-    collection_name = qualify_collection(f"{owner}_{name}_{mode}", tenant_id)
+    collection_name = qualify_collection(
+        f"{owner}_{name}_{mode}", tenant_id, embed_provider
+    )
     safe_event_id = event_id.replace("/", "-")[:40]
     temp_path = str(Path(os.getenv("CHROMA_DB_PATH", "./chroma_db")) / f".chunks_{collection_name}_{safe_event_id}.jsonl")
     Path(temp_path).parent.mkdir(parents=True, exist_ok=True)

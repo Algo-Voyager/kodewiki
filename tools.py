@@ -27,16 +27,6 @@ load_dotenv()
 CHROMA_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 
-def _make_embed_client() -> openai.OpenAI:
-    """Build a fresh embeddings client per call so the dashboard's X-VLLM-Key
-    override (set by the Inngest handler via auth.set_vllm_api_key_override) is
-    actually used. openai.OpenAI freezes its key at construction, so caching the
-    client at module-import would lock out the override."""
-    from auth import get_vllm_api_key
-    return openai.OpenAI(
-        base_url=os.getenv("EMBED_BASE_URL"),
-        api_key=get_vllm_api_key(),
-    )
 MAX_FILE_CHARS = 3000
 VALID_FILTER_TYPES = {"function", "class", "doc", "code"}
 
@@ -49,14 +39,13 @@ _TOOL_METRICS: ContextVar[dict] = ContextVar("_TOOL_METRICS", default={})
 def _parse_owner_repo(collection_name: str) -> tuple[str, str]:
     """Extract (owner, repo) from a collection name.
 
-    Accepts either the bare form ``{owner}_{name}_{mode}`` or the tenant-
-    qualified form ``{tenant_id}__{owner}_{name}_{mode}``. Tenant prefix is
-    stripped first so multi-tenant routing doesn't break PyGithub lookups.
+    Accepts the bare form ``{owner}_{name}_{mode}`` or the qualified form
+    ``{tenant}__{owner}_{name}_{mode}__{embed_provider}``. Both wrapper layers
+    are stripped first so PyGithub gets the raw owner/repo.
     """
-    from auth import TENANT_SEP
-    if TENANT_SEP in collection_name:
-        collection_name = collection_name.split(TENANT_SEP, 1)[1]
-    without_mode = collection_name.rsplit("_", 1)[0]
+    from auth import strip_collection
+    _, bare, _ = strip_collection(collection_name)
+    without_mode = bare.rsplit("_", 1)[0]
     owner, _, repo = without_mode.partition("_")
     if not owner or not repo:
         raise ValueError(
@@ -75,10 +64,18 @@ def _get_repo(collection_name: str):
 
 
 def _embed(text: str) -> list[float]:
+    """Embed a query string using the active embed provider.
+
+    Delegates to ingest.embed() which switches on provider (vllm/openai/gemini).
+    Provider-specific model defaults are resolved inside that call — we keep
+    EMBED_MODEL as a back-compat hint but it's only used when provider=vllm AND
+    no per-request override is set.
+    """
+    from ingest import embed as _provider_embed
     t0 = time.time()
-    resp = _make_embed_client().embeddings.create(input=[text], model=EMBED_MODEL)
+    vec = _provider_embed(text)
     _TOOL_METRICS.set({**_TOOL_METRICS.get({}), "embed_ms": round((time.time() - t0) * 1000)})
-    return resp.data[0].embedding
+    return vec
 
 
 def vector_search(

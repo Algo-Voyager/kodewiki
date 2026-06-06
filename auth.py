@@ -92,14 +92,27 @@ def get_vllm_api_key() -> str:
 # Provider is selected by the X-LLM-Provider header (Settings → dropdown).
 # When unset, falls back to "vllm" (the deploy's bundled Modal Qwen endpoint).
 
-SUPPORTED_PROVIDERS = ("vllm", "anthropic", "openai", "gemini")
+SUPPORTED_PROVIDERS = ("vllm", "openai", "gemini")
 
 # Sensible default model per provider — cheap + fast tiers. Override via the
 # X-LLM-Model header (Settings → model text input).
 DEFAULT_MODELS = {
-    "anthropic": "claude-haiku-4-5-20251001",
     "openai":    "gpt-4o-mini",
     "gemini":    "gemini-2.5-flash",
+}
+
+# ─── Embedding provider (separate from text-gen — they're independent) ──────
+# vllm = Modal bge-small-en-v1.5 (384-d, current default)
+# openai = text-embedding-3-small (1536-d)
+# gemini = text-embedding-004 (768-d)
+#
+# Anthropic is NOT in this list — Claude is chat-only, no embeddings.
+SUPPORTED_EMBED_PROVIDERS = ("vllm", "openai", "gemini")
+
+DEFAULT_EMBED_MODELS = {
+    "vllm":   "BAAI/bge-small-en-v1.5",
+    "openai": "text-embedding-3-small",
+    "gemini": "text-embedding-004",
 }
 
 _llm_provider_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -154,6 +167,53 @@ def get_llm_model(provider: str | None = None) -> str:
     return DEFAULT_MODELS.get(provider or get_llm_provider(), "")
 
 
+# ─── Embedding provider overrides (X-Embed-Provider/Key/Model headers) ──────
+
+_embed_provider_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "embed_provider_override", default=None
+)
+_embed_api_key_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "embed_api_key_override", default=None
+)
+_embed_model_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "embed_model_override", default=None
+)
+
+
+def set_embed_provider_override(provider: str | None) -> None:
+    if not provider:
+        _embed_provider_override.set(None)
+        return
+    p = provider.strip().lower()
+    _embed_provider_override.set(p if p in SUPPORTED_EMBED_PROVIDERS else None)
+
+
+def get_embed_provider() -> str:
+    """Active embedding provider — override first, falls back to ``vllm``."""
+    return _embed_provider_override.get() or "vllm"
+
+
+def set_embed_api_key_override(key: str | None) -> None:
+    _embed_api_key_override.set(key.strip() if key and key.strip() else None)
+
+
+def get_embed_api_key() -> str:
+    """Key for OpenAI / Gemini embeddings. For vllm, use get_vllm_api_key()."""
+    return _embed_api_key_override.get() or ""
+
+
+def set_embed_model_override(model: str | None) -> None:
+    _embed_model_override.set(model.strip() if model and model.strip() else None)
+
+
+def get_embed_model(provider: str | None = None) -> str:
+    """Effective embedding model name — override first, provider default otherwise."""
+    model = _embed_model_override.get()
+    if model:
+        return model
+    return DEFAULT_EMBED_MODELS.get(provider or get_embed_provider(), "")
+
+
 # ─── Tenancy ────────────────────────────────────────────────────────────────
 
 def set_tenant_id_override(tenant_id: str | None) -> None:
@@ -177,38 +237,81 @@ def get_tenant_id() -> str:
     return tid or SHARED_TENANT
 
 
-def qualify_collection(name: str, tenant_id: str | None = None) -> str:
-    """Prefix a bare collection name with the tenant scope.
+def qualify_collection(
+    name: str,
+    tenant_id: str | None = None,
+    embed_provider: str | None = None,
+) -> str:
+    """Build the full ChromaDB collection name.
 
-    >>> qualify_collection("0xnktd_fireranger_ast", "abc-123")
-    'abc-123__0xnktd_fireranger_ast'
+    Format:  ``{tenant_id}__{bare_name}__{embed_provider}``
 
-    Idempotent: if ``name`` already starts with the tenant prefix it's returned
-    unchanged. Pass ``tenant_id=None`` to read it from the ContextVar.
+    The embed-provider suffix forces a separate Chroma collection per
+    embedding model — ChromaDB collections have a fixed vector dimension, so
+    bge-small (384d), text-embedding-3-small (1536d), and text-embedding-004
+    (768d) can't share a collection. Tagging the name keeps them apart.
+
+    Idempotent: if ``name`` is already fully qualified, returned unchanged.
     """
     tid = tenant_id or get_tenant_id()
-    prefix = f"{tid}{TENANT_SEP}"
-    if name.startswith(prefix):
-        return name
-    return prefix + name
+    ep = embed_provider or get_embed_provider()
+    # Normalise: strip any prior tenant/embed wrapper, then re-wrap.
+    _, bare, _ = strip_collection(name)
+    return f"{tid}{TENANT_SEP}{bare}{TENANT_SEP}{ep}"
+
+
+def strip_collection(name: str) -> tuple[str, str, str]:
+    """Decompose a qualified collection name into (tenant_id, bare_name, embed_provider).
+
+    Handles three formats:
+      - new format     ``{tenant}__{bare}__{embed_provider}`` → all three set
+      - legacy format  ``{tenant}__{bare}``                   → embed_provider=""
+      - completely bare ``{bare}``                             → tenant="" embed_provider=""
+
+    We split on the FIRST and LAST ``__`` rather than partition so a bare name
+    containing the separator (unusual but possible) doesn't break parsing.
+    """
+    if TENANT_SEP not in name:
+        return "", name, ""
+    head, rest = name.split(TENANT_SEP, 1)
+    # Try to peel off an embed-provider suffix at the end.
+    if TENANT_SEP in rest:
+        bare, _, ep = rest.rpartition(TENANT_SEP)
+        if ep in SUPPORTED_EMBED_PROVIDERS:
+            return head, bare, ep
+        # Unknown suffix — assume the whole `rest` is the bare name (legacy
+        # format predates the embed-provider tag).
+    return head, rest, ""
 
 
 def strip_tenant(name: str) -> tuple[str, str]:
-    """Split a qualified collection name into (tenant_id, bare_name).
+    """Back-compat shim: (tenant_id, bare_name) — drops the embed_provider field.
 
-    If ``name`` lacks the ``tenant__`` prefix, returns ("", name) — used by the
-    list endpoint to filter out pre-existing legacy collections.
+    Kept for callers that don't care about embed provider (e.g. logging).
+    Prefer ``strip_collection`` for new code.
     """
-    if TENANT_SEP not in name:
-        return "", name
-    tid, _, bare = name.partition(TENANT_SEP)
+    tid, bare, _ = strip_collection(name)
     return tid, bare
 
 
-def belongs_to(name: str, tenant_id: str | None = None) -> bool:
-    """True if a qualified collection name belongs to the given tenant."""
-    tid = tenant_id or get_tenant_id()
-    return name.startswith(f"{tid}{TENANT_SEP}")
+def belongs_to(
+    name: str,
+    tenant_id: str | None = None,
+    embed_provider: str | None = None,
+) -> bool:
+    """True iff a qualified name matches the given tenant AND embed provider.
+
+    Embed provider only checked when ``embed_provider`` is provided; otherwise
+    legacy collections (no provider suffix) are accepted as belonging to the
+    tenant.
+    """
+    tid_want = tenant_id or get_tenant_id()
+    tid, _, ep = strip_collection(name)
+    if tid != tid_want:
+        return False
+    if embed_provider is not None and ep != embed_provider:
+        return False
+    return True
 
 
 # ─── Cooperative ingest cancellation ────────────────────────────────────────

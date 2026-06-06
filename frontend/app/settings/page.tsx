@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import {
   AlertTriangle,
+  Boxes,
   CheckCircle2,
   Copy,
   Cpu,
@@ -28,10 +29,20 @@ import {
   setStoredLlmApiKey,
   getStoredLlmModel,
   setStoredLlmModel,
+  getStoredEmbedProvider,
+  setStoredEmbedProvider,
+  getStoredEmbedApiKey,
+  setStoredEmbedApiKey,
+  getStoredEmbedModel,
+  setStoredEmbedModel,
   LLM_PROVIDERS,
   PROVIDER_LABEL,
   PROVIDER_DEFAULT_MODEL,
+  EMBED_PROVIDERS,
+  EMBED_PROVIDER_LABEL,
+  EMBED_PROVIDER_DEFAULT_MODEL,
   type LlmProvider,
+  type EmbedProvider,
 } from "@/lib/api";
 import {
   getOrCreateTenantId,
@@ -62,12 +73,19 @@ export default function SettingsPage() {
   const [tenantInput, setTenantInput] = useState("");
   const [tenantStatus, setTenantStatus] = useState<"idle" | "copied" | "reset" | "imported" | "invalid">("idle");
 
-  // Text-generation provider override (Anthropic / OpenAI / Gemini / vllm).
+  // Text-generation provider override (OpenAI / Gemini / vllm).
   const [provider, setProvider] = useState<LlmProvider>("vllm");
   const [providerKey, setProviderKey] = useState("");
   const [revealProvider, setRevealProvider] = useState(false);
   const [providerModel, setProviderModel] = useState("");
   const [savedProvider, setSavedProvider] = useState<"idle" | "saved" | "cleared">("idle");
+
+  // Embedding provider override (Modal / OpenAI / Gemini).
+  const [embedProvider, setEmbedProvider] = useState<EmbedProvider>("vllm");
+  const [embedKey, setEmbedKey] = useState("");
+  const [revealEmbed, setRevealEmbed] = useState(false);
+  const [embedModel, setEmbedModel] = useState("");
+  const [savedEmbed, setSavedEmbed] = useState<"idle" | "saved" | "cleared">("idle");
 
   // Hydrate inputs from localStorage on mount.
   useEffect(() => {
@@ -77,6 +95,9 @@ export default function SettingsPage() {
     setProvider(getStoredLlmProvider());
     setProviderKey(getStoredLlmApiKey());
     setProviderModel(getStoredLlmModel());
+    setEmbedProvider(getStoredEmbedProvider());
+    setEmbedKey(getStoredEmbedApiKey());
+    setEmbedModel(getStoredEmbedModel());
   }, []);
 
   const handleSave = () => {
@@ -143,6 +164,26 @@ export default function SettingsPage() {
     setTimeout(() => setSavedProvider("idle"), 2500);
   };
 
+  const handleSaveEmbed = () => {
+    setStoredEmbedProvider(embedProvider);
+    setStoredEmbedApiKey(embedKey);
+    setStoredEmbedModel(embedModel);
+    const cleared = embedProvider === "vllm" && !embedKey.trim() && !embedModel.trim();
+    setSavedEmbed(cleared ? "cleared" : "saved");
+    setTimeout(() => setSavedEmbed("idle"), 2500);
+  };
+
+  const handleClearEmbed = () => {
+    setEmbedProvider("vllm");
+    setEmbedKey("");
+    setEmbedModel("");
+    setStoredEmbedProvider("vllm");
+    setStoredEmbedApiKey("");
+    setStoredEmbedModel("");
+    setSavedEmbed("cleared");
+    setTimeout(() => setSavedEmbed("idle"), 2500);
+  };
+
   const handleImportTenant = () => {
     const ok = setTenantId(tenantInput);
     if (!ok) {
@@ -161,13 +202,23 @@ export default function SettingsPage() {
   const maskedProviderKey = providerKey && !revealProvider ? "•".repeat(Math.min(providerKey.length, 36)) : providerKey;
   const providerKeyPlaceholder: Record<LlmProvider, string> = {
     vllm: "(not needed — uses the Modal key below)",
-    anthropic: "sk-ant-…",
     openai: "sk-…",
     gemini: "AIza…",
   };
   const providerKeyDocsUrl: Record<LlmProvider, string> = {
     vllm: "",
-    anthropic: "https://console.anthropic.com/settings/keys",
+    openai: "https://platform.openai.com/api-keys",
+    gemini: "https://aistudio.google.com/apikey",
+  };
+
+  const maskedEmbedKey = embedKey && !revealEmbed ? "•".repeat(Math.min(embedKey.length, 36)) : embedKey;
+  const embedKeyPlaceholder: Record<EmbedProvider, string> = {
+    vllm: "(not needed — uses the Modal key below)",
+    openai: "sk-… (can reuse your Text Generation key)",
+    gemini: "AIza… (can reuse your Text Generation key)",
+  };
+  const embedKeyDocsUrl: Record<EmbedProvider, string> = {
+    vllm: "",
     openai: "https://platform.openai.com/api-keys",
     gemini: "https://aistudio.google.com/apikey",
   };
@@ -381,7 +432,126 @@ export default function SettingsPage() {
         </div>
       </section>
 
-      {/* ─── Modal / Embeddings key ─────────────────────────────────────── */}
+      {/* ─── Embeddings provider ────────────────────────────────────────── */}
+      <section className="rounded-xl border border-border bg-card p-6 space-y-4">
+        <div className="flex items-center gap-3">
+          <div className="rounded-lg bg-emerald-500/15 border border-emerald-500/30 p-2">
+            <Boxes className="h-5 w-5 text-emerald-400" />
+          </div>
+          <div>
+            <h2 className="text-base font-semibold text-foreground">
+              Embeddings
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              Encoder for vector search. Each provider outputs a different
+              dimension — switching here gives you a fresh workspace (old
+              collections from another provider stay isolated and you&apos;ll
+              need to re-ingest). Anthropic isn&apos;t listed because Claude is
+              chat-only.
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+            Provider
+          </label>
+          <select
+            value={embedProvider}
+            onChange={(e) => setEmbedProvider(e.target.value as EmbedProvider)}
+            className="w-full h-9 px-3 rounded-md border border-border bg-background text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40 focus-visible:border-emerald-500/40"
+          >
+            {EMBED_PROVIDERS.map((p) => (
+              <option key={p} value={p}>{EMBED_PROVIDER_LABEL[p]}</option>
+            ))}
+          </select>
+        </div>
+
+        {embedProvider !== "vllm" && (
+          <>
+            <div className="space-y-2">
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                API Key
+              </label>
+              <div className="flex gap-2">
+                <Input
+                  type={revealEmbed ? "text" : "password"}
+                  value={revealEmbed ? embedKey : maskedEmbedKey}
+                  onChange={(e) => setEmbedKey(e.target.value)}
+                  placeholder={embedKeyPlaceholder[embedProvider]}
+                  className="font-mono text-sm flex-1"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={() => setRevealEmbed((v) => !v)}
+                  title={revealEmbed ? "Hide key" : "Reveal key"}
+                >
+                  {revealEmbed ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </Button>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                Get a key at{" "}
+                <a
+                  href={embedKeyDocsUrl[embedProvider]}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-sky-400 hover:underline"
+                >
+                  {embedKeyDocsUrl[embedProvider].replace("https://", "")}
+                </a>
+                . Sent as <code className="px-1 rounded bg-muted">X-Embed-Key</code>. You can
+                reuse the same key as your Text Generation provider.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                Model <span className="text-[10px] normal-case text-muted-foreground/70">(optional)</span>
+              </label>
+              <Input
+                value={embedModel}
+                onChange={(e) => setEmbedModel(e.target.value)}
+                placeholder={`default: ${EMBED_PROVIDER_DEFAULT_MODEL[embedProvider]}`}
+                className="font-mono text-sm"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <p className="text-[11px] text-muted-foreground">
+                Vector dimension is fixed by the model — changing this requires re-ingest.
+              </p>
+            </div>
+          </>
+        )}
+
+        <div className="flex items-center gap-2 pt-2">
+          <Button onClick={handleSaveEmbed} className="bg-emerald-500 hover:bg-emerald-600 text-white">
+            <Save className="h-4 w-4 mr-2" />
+            Save
+          </Button>
+          <Button onClick={handleClearEmbed} variant="outline">
+            <Trash2 className="h-4 w-4 mr-2" />
+            Reset to default
+          </Button>
+          {savedEmbed === "saved" && (
+            <span className="ml-2 inline-flex items-center gap-1 text-xs text-emerald-400">
+              <CheckCircle2 className="h-4 w-4" />
+              Saved — re-ingest a repo to use this embedder.
+            </span>
+          )}
+          {savedEmbed === "cleared" && (
+            <span className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
+              <CheckCircle2 className="h-4 w-4" />
+              Reset — falling back to the bundled Modal bge-small.
+            </span>
+          )}
+        </div>
+      </section>
+
+      {/* ─── Modal Bearer Key (used when Modal is picked above) ─────────── */}
       <section className="rounded-xl border border-border bg-card p-6 space-y-4">
         <div className="flex items-center gap-3">
           <div className="rounded-lg bg-sky-500/15 border border-sky-500/30 p-2">
@@ -389,13 +559,13 @@ export default function SettingsPage() {
           </div>
           <div>
             <h2 className="text-base font-semibold text-foreground">
-              Modal / Embeddings Key <span className="text-xs font-normal text-muted-foreground">(Bearer)</span>
+              Modal Bearer Key <span className="text-xs font-normal text-muted-foreground">(Bearer)</span>
             </h2>
             <p className="text-xs text-muted-foreground">
-              Used for the embeddings endpoint, and for text generation when the
-              provider above is set to <code className="px-1 rounded bg-muted">Modal (Qwen)</code>.
-              Paste your own key if the deploy&apos;s default has rotated or to
-              point at your own Modal deployment.
+              Used by either Text Generation or Embeddings when their provider is set
+              to <code className="px-1 rounded bg-muted">Modal</code>. Paste your own if
+              the deploy&apos;s default has rotated or to point at your own Modal
+              deployment.
             </p>
           </div>
         </div>

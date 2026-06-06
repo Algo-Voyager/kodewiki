@@ -44,14 +44,19 @@ from auth import (
     TENANT_SEP,
     belongs_to,
     clear_ingest_cancelled,
+    get_embed_provider,
     mark_ingest_cancelled,
     qualify_collection,
+    set_embed_api_key_override,
+    set_embed_model_override,
+    set_embed_provider_override,
     set_github_token_override,
     set_llm_api_key_override,
     set_llm_model_override,
     set_llm_provider_override,
     set_tenant_id_override,
     set_vllm_api_key_override,
+    strip_collection,
     strip_tenant,
 )
 from eval.metrics import compute_aggregate_metrics
@@ -139,12 +144,19 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
     set_llm_provider_override(ctx.event.data.get("llm_provider"))
     set_llm_api_key_override(ctx.event.data.get("llm_api_key"))
     set_llm_model_override(ctx.event.data.get("llm_model"))
+    set_embed_provider_override(ctx.event.data.get("embed_provider"))
+    set_embed_api_key_override(ctx.event.data.get("embed_api_key"))
+    set_embed_model_override(ctx.event.data.get("embed_model"))
     set_tenant_id_override(tenant_id)
+
+    embed_provider = get_embed_provider()
 
     # Precompute the qualified collection name so the sidebar UI can poll for
     # progress under the same key the agent will later read.
     owner_repo = repo_slug.replace("/", "_") if "/" in repo_slug else repo_slug
-    qualified_name = qualify_collection(f"{owner_repo}_{mode}", tenant_id)
+    qualified_name = qualify_collection(
+        f"{owner_repo}_{mode}", tenant_id, embed_provider
+    )
     # If the user previously cancelled this collection and is now re-ingesting,
     # wipe the stale cancellation marker so this run isn't aborted at start.
     clear_ingest_cancelled(qualified_name)
@@ -165,7 +177,9 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
         # Step 1: fetch and chunk — async so PyGithub HTTP calls don't block the loop
         async def _fetch_and_chunk() -> dict:
             import asyncio as _aio
-            return await _aio.to_thread(fetch_and_chunk_repo, repo_slug, mode, event_id, tenant_id)
+            return await _aio.to_thread(
+                fetch_and_chunk_repo, repo_slug, mode, event_id, tenant_id, embed_provider
+            )
 
         chunks_data = await ctx.step.run("fetch-and-chunk", _fetch_and_chunk)
         _set_ingest_status(
@@ -279,6 +293,9 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
     set_llm_provider_override(ctx.event.data.get("llm_provider"))
     set_llm_api_key_override(ctx.event.data.get("llm_api_key"))
     set_llm_model_override(ctx.event.data.get("llm_model"))
+    set_embed_provider_override(ctx.event.data.get("embed_provider"))
+    set_embed_api_key_override(ctx.event.data.get("embed_api_key"))
+    set_embed_model_override(ctx.event.data.get("embed_model"))
     set_tenant_id_override(tenant_id)
 
     # Step: compress-history — always runs so Inngest replay order is stable.
@@ -557,6 +574,37 @@ def _extract_llm_model(request: Request) -> str | None:
     return m or None
 
 
+def _extract_embed_provider(request: Request) -> str | None:
+    """Selected embedding provider (X-Embed-Provider). One of
+    ``vllm`` / ``openai`` / ``gemini``. None falls back to ``vllm``."""
+    p = (request.headers.get("X-Embed-Provider") or "").strip().lower()
+    return p or None
+
+
+def _extract_embed_api_key(request: Request) -> str | None:
+    """Provider-specific embedding key (X-Embed-Key). Only used for non-vllm."""
+    k = (request.headers.get("X-Embed-Key") or "").strip()
+    return k or None
+
+
+def _extract_embed_model(request: Request) -> str | None:
+    """Optional embedding model override (X-Embed-Model)."""
+    m = (request.headers.get("X-Embed-Model") or "").strip()
+    return m or None
+
+
+def _apply_embed_overrides(request: Request) -> str:
+    """Pull X-Embed-* headers, set ContextVar overrides, return the active provider.
+
+    Used by REST endpoints that need to qualify collection names with the
+    embed provider before the Inngest job is even kicked off.
+    """
+    set_embed_provider_override(_extract_embed_provider(request))
+    set_embed_api_key_override(_extract_embed_api_key(request))
+    set_embed_model_override(_extract_embed_model(request))
+    return get_embed_provider()
+
+
 def _extract_tenant_id(request: Request) -> str:
     """Per-request tenant ID (X-Tenant-Id). Falls back to ``SHARED_TENANT``.
 
@@ -575,6 +623,7 @@ async def trigger_ingest(req: IngestRequest, request: Request):
     if req.repo.count("/") != 1:
         raise HTTPException(status_code=400, detail="repo must be in 'owner/name' form")
     tenant_id = _extract_tenant_id(request)
+    _apply_embed_overrides(request)  # so the in-process status tracker keys match
     await inngest_client.send(
         inngest.Event(
             name="repomind/ingest_repo",
@@ -586,6 +635,9 @@ async def trigger_ingest(req: IngestRequest, request: Request):
                 "llm_provider": _extract_llm_provider(request),
                 "llm_api_key": _extract_llm_api_key(request),
                 "llm_model": _extract_llm_model(request),
+                "embed_provider": _extract_embed_provider(request),
+                "embed_api_key": _extract_embed_api_key(request),
+                "embed_model": _extract_embed_model(request),
                 "tenant_id": tenant_id,
             },
         )
@@ -597,11 +649,13 @@ async def trigger_ingest(req: IngestRequest, request: Request):
 async def trigger_query(req: QueryRequest, request: Request):
     """Trigger an agent run. Poll /api/result/{session_id} for the answer."""
     tenant_id = _extract_tenant_id(request)
+    embed_provider = _apply_embed_overrides(request)
     # Client sends the bare collection name (e.g. "0xnktd_fireranger_ast");
-    # qualify here so the agent's vector_search hits THIS tenant's collection
-    # only — even if the client tries to spoof another tenant's prefix.
-    bare_name = strip_tenant(req.collection_name)[1]
-    qualified = qualify_collection(bare_name, tenant_id)
+    # qualify here so the agent's vector_search hits THIS tenant's + THIS embed
+    # provider's collection only — spoofing another tenant/provider's prefix is
+    # ignored because we always rebuild the wrapper from the headers.
+    _, bare_name, _ = strip_collection(req.collection_name)
+    qualified = qualify_collection(bare_name, tenant_id, embed_provider)
     session_id = str(uuid.uuid4())
     await inngest_client.send(
         inngest.Event(
@@ -614,6 +668,9 @@ async def trigger_query(req: QueryRequest, request: Request):
                 "llm_provider": _extract_llm_provider(request),
                 "llm_api_key": _extract_llm_api_key(request),
                 "llm_model": _extract_llm_model(request),
+                "embed_provider": _extract_embed_provider(request),
+                "embed_api_key": _extract_embed_api_key(request),
+                "embed_model": _extract_embed_model(request),
                 "tenant_id": tenant_id,
                 "session_id": session_id,
                 "history": req.history,
@@ -640,12 +697,17 @@ async def ingest_status(request: Request):
     ``error`` entries linger for 5 min so the UI can show the final state once.
     """
     tenant_id = _extract_tenant_id(request)
+    embed_provider = _apply_embed_overrides(request)
     _cleanup_ingest_status()
     out = []
     for qname, entry in _INGEST_STATUS.items():
         if entry.get("tenant_id") != tenant_id:
             continue
-        _, bare = strip_tenant(qname)
+        # Hide ingests that belong to a different embed provider — they'd be
+        # invisible in /api/collections too, so listing them here is misleading.
+        _, bare, ep = strip_collection(qname)
+        if ep and ep != embed_provider:
+            continue
         out.append({
             "collection_name": bare,
             "repo": entry.get("repo", ""),
@@ -677,15 +739,22 @@ async def get_result(session_id: str, request: Request):
 
 @app.get("/api/collections")
 async def list_collections(request: Request):
-    """List THIS tenant's ChromaDB collections with chunk counts (bare names)."""
+    """List THIS tenant's ChromaDB collections with chunk counts (bare names).
+
+    Filters to collections matching the calling tenant AND the current embed
+    provider — collections from a different embed provider have a different
+    vector dimension and can't be queried with the current setup, so listing
+    them would be misleading.
+    """
     tenant_id = _extract_tenant_id(request)
+    embed_provider = _apply_embed_overrides(request)
     try:
         client = chromadb.PersistentClient(path=os.getenv("CHROMA_DB_PATH", "./chroma_db"))
         result = []
         for col in client.list_collections():
-            if not belongs_to(col.name, tenant_id):
+            if not belongs_to(col.name, tenant_id, embed_provider):
                 continue
-            _, bare = strip_tenant(col.name)
+            _, bare, _ = strip_collection(col.name)
             try:
                 count = client.get_collection(col.name).count()
             except Exception:
@@ -728,10 +797,12 @@ async def list_chunks(
         raise HTTPException(status_code=400, detail="offset must be >= 0")
 
     tenant_id = _extract_tenant_id(request)
-    # Accept either the bare name or an already-qualified name from the client;
-    # always look up under the requesting tenant. Strips any spoofed prefix.
-    bare_name = strip_tenant(name)[1]
-    qualified = qualify_collection(bare_name, tenant_id)
+    embed_provider = _apply_embed_overrides(request)
+    # Strip any wrapper the client may have sent, then re-qualify with THIS
+    # tenant + embed provider. Spoofing another tenant or provider's prefix
+    # gets sanitised away.
+    _, bare_name, _ = strip_collection(name)
+    qualified = qualify_collection(bare_name, tenant_id, embed_provider)
 
     try:
         client = chromadb.PersistentClient(path=os.getenv("CHROMA_DB_PATH", "./chroma_db"))
@@ -799,8 +870,9 @@ async def delete_collection(name: str, request: Request):
     re-create the collection seconds later.
     """
     tenant_id = _extract_tenant_id(request)
-    bare_name = strip_tenant(name)[1]
-    qualified = qualify_collection(bare_name, tenant_id)
+    embed_provider = _apply_embed_overrides(request)
+    _, bare_name, _ = strip_collection(name)
+    qualified = qualify_collection(bare_name, tenant_id, embed_provider)
 
     # 1. Mark cancelled — any embed loop on this collection sees this on its
     # next iteration and raises IngestCancelled, which the Inngest handler

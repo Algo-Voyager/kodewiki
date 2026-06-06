@@ -38,7 +38,10 @@ def _generate(prompt: str, max_new_tokens: int = 512, temperature: float = 0.2) 
     """Provider-switching text generation.
 
     Reads the active provider from auth (X-LLM-Provider header → ContextVar).
-    Supported: ``vllm`` (default, Modal Qwen) | ``anthropic`` | ``openai`` | ``gemini``.
+    Supported: ``vllm`` (default, Modal Qwen) | ``openai`` | ``gemini``.
+
+    Anthropic was considered but dropped — Claude is chat-only, can't do
+    embeddings, and supporting one half of a provider creates UX confusion.
 
     Each non-vllm branch needs a key in ``auth.get_llm_api_key()`` (X-LLM-Key);
     a missing key raises with a hint to set it in the dashboard's Settings page.
@@ -52,8 +55,6 @@ def _generate(prompt: str, max_new_tokens: int = 512, temperature: float = 0.2) 
     provider = get_llm_provider()
     if provider == "vllm":
         return _generate_vllm(prompt, max_new_tokens, temperature, get_vllm_api_key())
-    if provider == "anthropic":
-        return _generate_anthropic(prompt, max_new_tokens, temperature, get_llm_api_key(), get_llm_model(provider))
     if provider == "openai":
         return _generate_openai(prompt, max_new_tokens, temperature, get_llm_api_key(), get_llm_model(provider))
     if provider == "gemini":
@@ -82,31 +83,6 @@ def _generate_vllm(prompt: str, max_new_tokens: int, temperature: float, key: st
     )
     resp.raise_for_status()
     return resp.json()["response"].strip()
-
-
-def _generate_anthropic(prompt: str, max_new_tokens: int, temperature: float, key: str, model: str) -> str:
-    """Anthropic Messages API. Concatenates ``text`` content blocks."""
-    _require_key("Anthropic", key)
-    resp = httpx.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": model,
-            "max_tokens": max_new_tokens,
-            "temperature": temperature,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=120.0,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return "".join(
-        block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
-    ).strip()
 
 
 def _generate_openai(prompt: str, max_new_tokens: int, temperature: float, key: str, model: str) -> str:
