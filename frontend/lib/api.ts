@@ -1,3 +1,5 @@
+import { getOrCreateTenantId } from "./tenant";
+
 // Local dev: BASE = "/api" → next.config.ts rewrites to http://localhost:8000.
 // Production (Vercel): set NEXT_PUBLIC_API_URL=https://<render-app>.onrender.com/api
 // to call the Render backend directly. CORS middleware on the backend allows it.
@@ -60,6 +62,8 @@ export function setStoredVllmApiKey(key: string): void {
 
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = {};
+  const tenant = getOrCreateTenantId();
+  if (tenant) headers["X-Tenant-Id"] = tenant;
   const gh   = getStoredGithubToken();
   const vllm = getStoredVllmApiKey();
   if (gh)   headers["X-Github-Token"] = gh;
@@ -107,7 +111,7 @@ export interface AgentResult {
 }
 
 export async function fetchCollections(): Promise<Collection[]> {
-  const res = await fetch(`${BASE}/collections`);
+  const res = await fetch(`${BASE}/collections`, { headers: authHeaders() });
   if (!res.ok) return [];
   const data = await res.json();
   return data.collections ?? [];
@@ -143,28 +147,28 @@ export async function triggerQuery(
 export async function pollResult(
   sessionId: string
 ): Promise<AgentResult | null> {
-  const res = await fetch(`${BASE}/result/${sessionId}`);
+  const res = await fetch(`${BASE}/result/${sessionId}`, { headers: authHeaders() });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`Poll failed (${res.status})`);
   return res.json();
 }
 
 export async function fetchLogs(limit = 50): Promise<LogEntry[]> {
-  const res = await fetch(`${BASE}/logs?limit=${limit}`);
+  const res = await fetch(`${BASE}/logs?limit=${limit}`, { headers: authHeaders() });
   if (!res.ok) return [];
   const data = await res.json();
   return data.logs ?? [];
 }
 
 export async function fetchSessionLogs(sessionId: string): Promise<LogEntry[]> {
-  const res = await fetch(`${BASE}/logs/${sessionId}`);
+  const res = await fetch(`${BASE}/logs/${sessionId}`, { headers: authHeaders() });
   if (!res.ok) return [];
   const data = await res.json();
   return data.logs ?? [];
 }
 
 export async function fetchMetrics(): Promise<Metrics> {
-  const res = await fetch(`${BASE}/metrics`);
+  const res = await fetch(`${BASE}/metrics`, { headers: authHeaders() });
   if (!res.ok) return {};
   return res.json();
 }

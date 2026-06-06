@@ -1,7 +1,19 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { CheckCircle2, Cpu, Eye, EyeOff, KeyRound, Save, Trash2 } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Copy,
+  Cpu,
+  Eye,
+  EyeOff,
+  KeyRound,
+  RefreshCw,
+  Save,
+  Trash2,
+  Users,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -10,6 +22,11 @@ import {
   getStoredVllmApiKey,
   setStoredVllmApiKey,
 } from "@/lib/api";
+import {
+  getOrCreateTenantId,
+  resetTenantId,
+  setTenantId,
+} from "@/lib/tenant";
 
 /**
  * Settings page — currently just the GitHub PAT override.
@@ -30,10 +47,15 @@ export default function SettingsPage() {
   const [revealVllm, setRevealVllm] = useState(false);
   const [savedVllm, setSavedVllm] = useState<"idle" | "saved" | "cleared">("idle");
 
+  const [tenant, setTenant] = useState("");
+  const [tenantInput, setTenantInput] = useState("");
+  const [tenantStatus, setTenantStatus] = useState<"idle" | "copied" | "reset" | "imported" | "invalid">("idle");
+
   // Hydrate inputs from localStorage on mount.
   useEffect(() => {
     setToken(getStoredGithubToken());
     setVllmKey(getStoredVllmApiKey());
+    setTenant(getOrCreateTenantId());
   }, []);
 
   const handleSave = () => {
@@ -60,6 +82,37 @@ export default function SettingsPage() {
     setStoredVllmApiKey("");
     setSavedVllm("cleared");
     setTimeout(() => setSavedVllm("idle"), 2500);
+  };
+
+  const handleCopyTenant = async () => {
+    try {
+      await navigator.clipboard.writeText(tenant);
+      setTenantStatus("copied");
+      setTimeout(() => setTenantStatus("idle"), 2500);
+    } catch {
+      /* clipboard denied — silent */
+    }
+  };
+
+  const handleResetTenant = () => {
+    const next = resetTenantId();
+    setTenant(next);
+    setTenantInput("");
+    setTenantStatus("reset");
+    setTimeout(() => setTenantStatus("idle"), 2500);
+  };
+
+  const handleImportTenant = () => {
+    const ok = setTenantId(tenantInput);
+    if (!ok) {
+      setTenantStatus("invalid");
+      setTimeout(() => setTenantStatus("idle"), 2500);
+      return;
+    }
+    setTenant(tenantInput.trim());
+    setTenantInput("");
+    setTenantStatus("imported");
+    setTimeout(() => setTenantStatus("idle"), 2500);
   };
 
   const masked = token && !reveal ? "•".repeat(Math.min(token.length, 36)) : token;
@@ -224,6 +277,113 @@ export default function SettingsPage() {
             <span className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
               <CheckCircle2 className="h-4 w-4" />
               Cleared — falling back to the server&apos;s default.
+            </span>
+          )}
+        </div>
+      </section>
+
+      {/* ─── Workspace identity (anonymous tenant ID) ───────────────────── */}
+      <section className="rounded-xl border border-border bg-card p-6 space-y-4">
+        <div className="flex items-center gap-3">
+          <div className="rounded-lg bg-violet-500/15 border border-violet-500/30 p-2">
+            <Users className="h-5 w-5 text-violet-400" />
+          </div>
+          <div>
+            <h2 className="text-base font-semibold text-foreground">
+              Workspace Identity <span className="text-xs font-normal text-muted-foreground">(no login needed)</span>
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              A random ID minted in this browser. Scopes <em>your</em> ingested
+              repos, chat history, and logs — nobody else can see them. Clearing
+              browser data, switching browsers, or switching devices means losing
+              access to this workspace unless you copy the ID over manually.
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+            Your tenant ID
+          </label>
+          <div className="flex gap-2">
+            <Input
+              value={tenant}
+              readOnly
+              className="font-mono text-sm flex-1"
+              onFocus={(e) => e.currentTarget.select()}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={handleCopyTenant}
+              title="Copy to clipboard"
+              disabled={!tenant}
+            >
+              <Copy className="h-4 w-4" />
+            </Button>
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Sent as <code className="px-1 rounded bg-muted">X-Tenant-Id</code> on
+            every request. Treat it like a session token — anyone with this string
+            can read your workspace.
+          </p>
+        </div>
+
+        <div className="space-y-2 pt-2 border-t border-border">
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+            Import a tenant ID
+          </label>
+          <div className="flex gap-2">
+            <Input
+              value={tenantInput}
+              onChange={(e) => setTenantInput(e.target.value)}
+              placeholder="Paste an existing workspace ID to switch into it"
+              className="font-mono text-sm flex-1"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <Button onClick={handleImportTenant} variant="outline" disabled={!tenantInput.trim()}>
+              Use this ID
+            </Button>
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Use this to access the same workspace from another device — copy your
+            tenant ID from one browser, paste it here in another.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 pt-2 border-t border-border">
+          <Button
+            onClick={handleResetTenant}
+            variant="outline"
+            className="text-amber-400 border-amber-500/30 hover:bg-amber-500/10"
+          >
+            <RefreshCw className="h-4 w-4 mr-2" />
+            Generate new ID
+          </Button>
+          {tenantStatus === "copied" && (
+            <span className="ml-2 inline-flex items-center gap-1 text-xs text-emerald-400">
+              <CheckCircle2 className="h-4 w-4" />
+              Copied to clipboard.
+            </span>
+          )}
+          {tenantStatus === "reset" && (
+            <span className="ml-2 inline-flex items-center gap-1 text-xs text-amber-400">
+              <AlertTriangle className="h-4 w-4" />
+              New workspace started — old repos/logs are no longer visible to you.
+            </span>
+          )}
+          {tenantStatus === "imported" && (
+            <span className="ml-2 inline-flex items-center gap-1 text-xs text-emerald-400">
+              <CheckCircle2 className="h-4 w-4" />
+              Switched workspace — reload to see its repos.
+            </span>
+          )}
+          {tenantStatus === "invalid" && (
+            <span className="ml-2 inline-flex items-center gap-1 text-xs text-rose-400">
+              <AlertTriangle className="h-4 w-4" />
+              Invalid ID — letters / digits / dot / dash / underscore only.
             </span>
           )}
         </div>
