@@ -412,11 +412,9 @@ def fetch_and_chunk_repo(repo_slug: str, mode: str, event_id: str = "cli") -> di
         raise ValueError(f"repo must be 'owner/name'; got {repo_slug!r}")
     owner, name = repo_slug.split("/", 1)
 
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        raise RuntimeError("GITHUB_TOKEN is not set. Add it to .env.")
-
-    gh = Github(auth=Auth.Token(token))
+    # ContextVar override (PAT from dashboard Settings) wins; env-var is fallback.
+    from auth import get_github_token
+    gh = Github(auth=Auth.Token(get_github_token()))
     repo = gh.get_repo(repo_slug)
 
     collection_name = f"{owner}_{name}_{mode}"

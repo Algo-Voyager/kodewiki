@@ -33,12 +33,13 @@ import uuid
 import inngest
 import inngest.fast_api
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import chromadb
 
+from auth import set_github_token_override
 from eval.metrics import compute_aggregate_metrics
 from ingest import embed_and_store_chunks, fetch_and_chunk_repo
 from inngest_setup import inngest_client
@@ -89,6 +90,9 @@ async def ingest_repo_fn(ctx: inngest.Context) -> dict:
     repo_slug: str = ctx.event.data["repo"]
     mode: str = ctx.event.data.get("mode", "ast")
     event_id: str = ctx.event.id
+
+    # User-supplied PAT override (from dashboard Settings) — falls back to env.
+    set_github_token_override(ctx.event.data.get("github_token"))
 
     # Step 1: fetch and chunk — async so PyGithub HTTP calls don't block the loop
     async def _fetch_and_chunk() -> dict:
@@ -170,6 +174,9 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
     session_id: str = ctx.event.data.get("session_id") or ctx.event.id
     history: list[dict] = ctx.event.data.get("history", [])
     run_start = time.time()
+
+    # User-supplied PAT override (from dashboard Settings) — falls back to env.
+    set_github_token_override(ctx.event.data.get("github_token"))
 
     # Step: compress-history — always runs so Inngest replay order is stable.
     # Only makes an LLM call when total history chars exceed the threshold.
@@ -414,22 +421,32 @@ class QueryRequest(BaseModel):
     history: list[dict] = []
 
 
+def _extract_user_github_token(request: Request) -> str | None:
+    """Per-request PAT override from the dashboard Settings page. None if absent."""
+    tok = (request.headers.get("X-Github-Token") or "").strip()
+    return tok or None
+
+
 @app.post("/api/ingest")
-async def trigger_ingest(req: IngestRequest):
+async def trigger_ingest(req: IngestRequest, request: Request):
     """Trigger a background repo ingestion job."""
     if req.repo.count("/") != 1:
         raise HTTPException(status_code=400, detail="repo must be in 'owner/name' form")
     await inngest_client.send(
         inngest.Event(
             name="repomind/ingest_repo",
-            data={"repo": req.repo, "mode": req.mode},
+            data={
+                "repo": req.repo,
+                "mode": req.mode,
+                "github_token": _extract_user_github_token(request),
+            },
         )
     )
     return {"status": "triggered", "repo": req.repo, "mode": req.mode}
 
 
 @app.post("/api/query")
-async def trigger_query(req: QueryRequest):
+async def trigger_query(req: QueryRequest, request: Request):
     """Trigger an agent run. Poll /api/result/{session_id} for the answer."""
     session_id = str(uuid.uuid4())
     await inngest_client.send(
@@ -438,6 +455,7 @@ async def trigger_query(req: QueryRequest):
             data={
                 "query": req.query,
                 "collection_name": req.collection_name,
+                "github_token": _extract_user_github_token(request),
                 "session_id": session_id,
                 "history": req.history,
             },

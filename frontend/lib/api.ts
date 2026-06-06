@@ -3,6 +3,46 @@
 // to call the Render backend directly. CORS middleware on the backend allows it.
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "/api";
 
+// ─── User-supplied API key override ─────────────────────────────────────────
+// If the user has pasted a personal GitHub PAT on the Settings page, we read
+// it from localStorage and send it as X-Github-Token. The backend's
+// set_github_token_override() consumes it. Falls back to env GITHUB_TOKEN
+// (configured on Render) when absent — i.e. no header sent ≠ broken request.
+export const USER_TOKENS_KEY = "repomind:user-tokens:v1";
+
+export function getStoredGithubToken(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    const raw = window.localStorage.getItem(USER_TOKENS_KEY);
+    if (!raw) return "";
+    const parsed = JSON.parse(raw) as { github_token?: string };
+    return (parsed.github_token ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
+export function setStoredGithubToken(token: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (token.trim()) {
+      window.localStorage.setItem(
+        USER_TOKENS_KEY,
+        JSON.stringify({ github_token: token.trim() }),
+      );
+    } else {
+      window.localStorage.removeItem(USER_TOKENS_KEY);
+    }
+  } catch {
+    /* private mode / quota — silent */
+  }
+}
+
+function authHeaders(): Record<string, string> {
+  const t = getStoredGithubToken();
+  return t ? { "X-Github-Token": t } : {};
+}
+
 export interface Collection {
   name: string;
   chunk_count: number;
@@ -52,7 +92,7 @@ export async function fetchCollections(): Promise<Collection[]> {
 export async function ingestRepo(repo: string, mode: string): Promise<void> {
   const res = await fetch(`${BASE}/ingest`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ repo, mode }),
   });
   if (!res.ok) {
@@ -68,7 +108,7 @@ export async function triggerQuery(
 ): Promise<string> {
   const res = await fetch(`${BASE}/query`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ query, collection_name, history }),
   });
   if (!res.ok) throw new Error(`Query trigger failed (${res.status})`);

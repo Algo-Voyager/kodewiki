@@ -17,6 +17,7 @@ import {
   AlertCircle,
   Database,
   ChevronRight,
+  Settings as SettingsIcon,
 } from "lucide-react";
 import { fetchCollections, ingestRepo, type Collection } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -52,6 +53,15 @@ const NAV = [
     bg: "bg-emerald-500/15",
     activeBg: "bg-emerald-500/20",
     activeBorder: "border-emerald-500/30",
+  },
+  {
+    href: "/settings",
+    label: "Settings",
+    icon: SettingsIcon,
+    color: "text-amber-400",
+    bg: "bg-amber-500/15",
+    activeBg: "bg-amber-500/20",
+    activeBorder: "border-amber-500/30",
   },
 ] as const;
 

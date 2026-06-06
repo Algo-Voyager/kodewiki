@@ -52,11 +52,11 @@ def _parse_owner_repo(collection_name: str) -> tuple[str, str]:
 
 
 def _get_repo(collection_name: str):
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        raise RuntimeError("GITHUB_TOKEN is not set. Add it to .env.")
+    # ContextVar override (e.g. PAT pasted in the dashboard Settings page) wins,
+    # env-var GITHUB_TOKEN is the fallback. See auth.py.
+    from auth import get_github_token
     owner, repo = _parse_owner_repo(collection_name)
-    gh = Github(auth=Auth.Token(token))
+    gh = Github(auth=Auth.Token(get_github_token()))
     return gh.get_repo(f"{owner}/{repo}")
 
 
