@@ -59,6 +59,45 @@ export default function ChatPage() {
   // Per-collection compressed context (not shown in UI)
   const contextRef = useRef<Record<string, ContextMessage[]>>({});
 
+  // ── Persistence (localStorage) ───────────────────────────────────────
+  // Survives page refresh AND tab close. Stored under one key so we save
+  // histories + the (server-compressed) context together. Bump the version
+  // suffix on the key if the shape of stored state changes.
+  const CHAT_STATE_KEY = "repomind:chat-state:v1";
+  const hydratedRef = useRef(false);
+
+  // Load once on mount BEFORE the first save effect can clobber storage.
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(CHAT_STATE_KEY);
+      if (raw) {
+        const saved = JSON.parse(raw) as {
+          histories?: ChatHistories;
+          contexts?: Record<string, ContextMessage[]>;
+        };
+        if (saved.histories && typeof saved.histories === "object") {
+          setHistories(saved.histories);
+        }
+        if (saved.contexts && typeof saved.contexts === "object") {
+          contextRef.current = saved.contexts;
+        }
+      }
+    } catch { /* private mode / quota / parse error — silently start fresh */ }
+    hydratedRef.current = true;
+  }, []);
+
+  // Save on every histories change. contextRef updates happen in the same
+  // request-completion code path as histories updates, so this catches both.
+  useEffect(() => {
+    if (!hydratedRef.current) return;  // skip the initial empty {} write before hydrate
+    try {
+      window.localStorage.setItem(
+        CHAT_STATE_KEY,
+        JSON.stringify({ histories, contexts: contextRef.current }),
+      );
+    } catch { /* quota exceeded — drop save silently */ }
+  }, [histories]);
+
   // Mouse tracking for gradient follow effect
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) =>

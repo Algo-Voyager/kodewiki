@@ -43,6 +43,10 @@ function MermaidBlock({ code }: { code: string }) {
       mermaid.initialize({
         startOnLoad: false,
         theme: "dark",
+        // Match chat-body font size (13px) so diagram text reads like prose,
+        // not poster-sized. Default Mermaid font is 16px which compounds with
+        // the bloated container we used to render at 100% width.
+        fontFamily: "var(--font-sans, system-ui, sans-serif)",
         themeVariables: {
           background:           "#0d0d10",
           primaryColor:         "#0c4a6e",
@@ -55,7 +59,18 @@ function MermaidBlock({ code }: { code: string }) {
           nodeTextColor:        "#f0f9ff",
           clusterBkg:           "#111827",
           titleColor:           "#bae6fd",
+          fontSize:             "13px",
         },
+        // useMaxWidth=false → Mermaid emits the SVG at its NATURAL content size
+        // (sets explicit width/height attributes). Our CSS below then bounds it
+        // via max-width / max-height. Without this, Mermaid stretches the SVG
+        // to fill any container, which is what made small diagrams huge.
+        flowchart:       { useMaxWidth: false, htmlLabels: true, padding: 12 },
+        class:           { useMaxWidth: false },
+        sequence:        { useMaxWidth: false },
+        gantt:           { useMaxWidth: false },
+        state:           { useMaxWidth: false },
+        er:              { useMaxWidth: false },
       });
       const id = `mermaid-${Math.random().toString(36).slice(2)}`;
       mermaid
@@ -65,11 +80,16 @@ function MermaidBlock({ code }: { code: string }) {
           ref.current.innerHTML = svg;
           const svgEl = ref.current.querySelector("svg");
           if (svgEl) {
-            svgEl.removeAttribute("width");
-            svgEl.removeAttribute("height");
-            svgEl.style.width = "100%";
-            svgEl.style.height = "auto";
-            svgEl.style.maxWidth = "100%";
+            // KEEP Mermaid's intrinsic width/height attributes — those tell us
+            // the diagram's natural size (e.g. 480×320). Just bound them via
+            // CSS so tall diagrams don't dominate the chat AND tiny diagrams
+            // don't get artificially blown up to fill the container.
+            svgEl.style.maxWidth   = "100%";
+            svgEl.style.maxHeight  = "60vh";
+            svgEl.style.width      = "auto";
+            svgEl.style.height     = "auto";
+            svgEl.style.display    = "block";
+            svgEl.style.margin     = "0 auto";   // centre when narrower than container
           }
           setSvgContent(ref.current.innerHTML);
         })
