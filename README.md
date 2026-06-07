@@ -1,144 +1,107 @@
-# repomind
+# KodeWiki
 
-A developer documentation agent — point it at a GitHub repo and ask questions about the code in plain English. Answers are grounded in the repo: the agent retrieves relevant chunks from a local vector index and cites file paths and line numbers.
+Ask plain-English questions about any GitHub repo and get answers grounded in the code with file-path + line-number citations. The agent runs vector search over chunks of the repo, then a ReAct loop to assemble the answer.
 
-> Full architecture, chunking deep-dive, and engineering decisions → [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+**Live:** [kodewiki.vercel.app](https://kodewiki.vercel.app)
+**Architecture deep-dive:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
 ---
 
 ## Stack
 
-| Layer | Technology |
-|-------|-----------|
-| **LLM** | `Qwen/Qwen2.5-7B-Instruct` on Modal (custom `/generate` endpoint) |
-| **Agent loop** | Text-based ReAct — parses `Action` / `Action Input` from model output |
-| **Embeddings** | `BAAI/bge-small-en-v1.5` on Modal — OpenAI-compatible `/v1/embeddings` |
-| **Vector DB** | ChromaDB (persistent, `./chroma_db`) |
-| **Backend** | FastAPI + [Inngest](https://www.inngest.com) for durable background jobs |
-| **Frontend** | Next.js (App Router) |
-| **GitHub API** | PyGithub |
-| **Production deploy** | Vercel (frontend) + Render (backend) + Inngest Cloud + Modal |
+| Layer | Default | Override per user |
+|---|---|---|
+| **Text generation** | Qwen2.5-7B on Modal (custom `/generate`) | OpenAI / Gemini via Settings → X-LLM-* headers |
+| **Embeddings** | bge-small-en-v1.5 (384d) on Modal | OpenAI `text-embedding-3-small` (1536d) / Gemini `gemini-embedding-001` (3072d) |
+| **Code chunking** | Python `ast` for `.py`; **tree-sitter cAST** for 306+ other languages; H2-headings for `.md`; naive sliding-window as fallback | — |
+| **Agent loop** | Text-based ReAct (parses `Action:` / `Action Input:`) | — |
+| **Vector DB** | ChromaDB persistent client (`./chroma_db`) | — |
+| **Backend** | FastAPI + [Inngest](https://www.inngest.com) durable jobs | — |
+| **Frontend** | Next.js (App Router) | — |
+| **Production hosts** | Vercel + Render + Inngest Cloud + Modal | — |
 
 No LangChain. No LlamaIndex.
 
-> AST-based chunking is validated by the [cAST (2025)](https://arxiv.org/abs/2506.15655) paper — *Enhancing Code RAG with Structural Chunking via Abstract Syntax Tree* — which reports +4.3 Recall@5 and +5.6 Pass@1 on Python repos over naive sliding-window chunking.
+> **Chunking:** AST-aware splits beat sliding-window for code RAG — the [cAST (2025)](https://arxiv.org/abs/2506.15655) paper reports +4.3 Recall@5 / +5.6 Pass@1. Python uses the stdlib `ast` module for richer metadata; everything else uses tree-sitter via [`tree_sitter_chunker.py`](tree_sitter_chunker.py) with cAST's recursive split-then-merge algorithm.
 
 ---
 
-## Setup
+## Multi-tenant & BYO keys
 
-### 1. Python environment
+Every browser gets an **anonymous tenant ID** (UUID in localStorage, sent as `X-Tenant-Id`). It scopes:
+
+- Sidebar collections list
+- Ingested ChromaDB collections (`{tenant}__{repo}_{mode}__{embed_provider}`)
+- Agent logs + metrics
+- Chunks endpoint, query results, chat history
+
+Open `/settings` to override the deploy's defaults (stored in `localStorage`, never persisted on the server):
+
+| Card | Headers | When to use |
+|---|---|---|
+| GitHub PAT | `X-Github-Token` | Server default expired / private repo access |
+| Text Generation | `X-LLM-Provider` + `X-LLM-Key` + `X-LLM-Model` | Run on your OpenAI / Gemini key |
+| Embeddings | `X-Embed-Provider` + `X-Embed-Key` + `X-Embed-Model` | Use your own embedding model (different dim = separate workspace) |
+| Modal Bearer Key | `X-VLLM-Key` | Custom Modal deployment |
+| Workspace Identity | `X-Tenant-Id` | Reset / import a tenant ID across devices |
+
+---
+
+## Setup (local)
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env   # fill in VLLM_API_KEY, QWEN_GENERATE_URL, EMBED_BASE_URL, GITHUB_TOKEN
+
+# (one-time) deploy Modal services
+cd ../rag-learning && modal deploy qwen_modal.py && cd -
+
+# 3 terminals
+uvicorn server:app --reload --port 8000
+npx inngest-cli@latest dev -u http://localhost:8000/api/inngest          # UI at :8288
+cd frontend && npm install && npm run dev                                  # UI at :3000
 ```
 
-### 2. Deploy Modal services
-
-Both the LLM and embeddings run on Modal (shared with rag-learning). Deploy once:
-
-```bash
-cd ../rag-learning
-modal deploy qwen_modal.py
-cd ../repomind
-```
-
-### 3. Environment variables
-
-```bash
-cp .env.example .env
-```
+### Required env vars
 
 | Variable | Description |
-|----------|-------------|
-| `VLLM_API_KEY` | Shared API key for both Modal services |
-| `QWEN_GENERATE_URL` | LLM generate endpoint URL from Modal |
-| `EMBED_BASE_URL` | Embedding endpoint URL from Modal — **must end with `/v1`** |
+|---|---|
+| `VLLM_API_KEY` | Modal Bearer key (shared for generate + embed endpoints) |
+| `QWEN_GENERATE_URL` | LLM endpoint from Modal |
+| `EMBED_BASE_URL` | Embedding endpoint from Modal — **must end with `/v1`** |
 | `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` |
-| `GITHUB_TOKEN` | GitHub personal access token (repo read access) |
+| `GITHUB_TOKEN` | GitHub PAT (repo:read) |
 
-### 4. Run
-
-Open three terminals:
+### CLI (no server)
 
 ```bash
-# Terminal 1 — FastAPI + Inngest backend
-uvicorn server:app --port 8000
-
-# Terminal 2 — Inngest Dev Server  (UI at http://localhost:8288)
-npx inngest-cli@latest dev -u http://localhost:8000/api/inngest
-
-# Terminal 3 — Next.js frontend  (http://localhost:3000)
-cd frontend && npm install && npm run dev
+python ingest.py <owner>/<repo> <ast|naive>
+python agent.py <owner>_<repo>_<mode> "How does error handling work?"
+python tools.py <owner>_<repo>_<mode>     # smoke-test retrieval
 ```
 
 ---
 
 ## Usage
 
-**Ingest a repo** — enter `owner/repo` in the sidebar, choose AST or Naive mode, click "Ingest Repo". Progress is visible in the Inngest Dev UI at `localhost:8288`.
+**Ingest** — paste `owner/repo` in the sidebar, pick AST or Naive, click *Ingest Repo*. The row appears instantly with a spinning ring around the chunk-count badge; live progress polls the backend every 3s. Hover a row for a 🗑 trash button (cancels in-flight ingests + drops the Chroma collection).
 
-**Ask questions** — select an indexed repo from the sidebar and type your question in the chat.
+**Ask** — pick an indexed repo, type your question. The agent runs a ReAct loop (`vector_search` → `get_file` → `get_recent_commits` as needed). Mermaid diagrams render inline; chat history persists in `localStorage`.
 
-The agent processes the query asynchronously — the UI shows a live "Agent working…" indicator while the ReAct loop runs tool calls in the background.
-
-![Agent processing a query in real time](assest/waiting_for_response.png)
-
-Once the loop completes, the answer streams in with file-path citations. Asking for a diagram or flowchart produces an interactive Mermaid chart you can click to zoom.
-
-![LLM response with codebase explanation](assest/llm_response.png)
-
-Every run is tracked as a durable job in Inngest — open `localhost:8288` to inspect each pipeline step and its timing.
-
-![Inngest Dev Server showing a full agent run with step-level timing](assest/inngest_info.png)
-
-**Run the benchmark** — after ingesting both `ast` and `naive` collections:
+**Inspect chunks** (any tenant):
 
 ```bash
-python eval/compare.py <owner>/<repo>
+BASE=https://<your-render>.onrender.com/api
+TID=<your-tenant-id-from-settings>
+curl "$BASE/collections" -H "X-Tenant-Id: $TID" | jq
+curl "$BASE/collections/<name>/chunks?limit=5&chunk_type=function" -H "X-Tenant-Id: $TID" | jq
 ```
 
-Results appear on the `/benchmarks` page.
-
-### Settings — bring your own API keys
-
-Open `/settings` to paste personal credentials when the server's defaults are expired, rate-limited, or you want to query a private repo your team owns:
-
-| Key | Header | Used for |
-|-----|--------|----------|
-| GitHub PAT | `X-Github-Token` | Repo ingestion, file/commit fetch |
-| LLM API key | `X-VLLM-Key` | Qwen generation + embeddings |
-
-Both are stored in `localStorage` under `repomind:user-tokens:v1` (browser-local, never sent anywhere except as headers on `/api/ingest` and `/api/query`). The backend's `auth.py` reads each header into a `ContextVar` override; when absent, it falls back to the server-side env var. Clear from the same page when done on a shared device.
-
-### Chat persistence
-
-Chat threads and the per-collection compressed history are persisted to `localStorage` under `repomind:chat-state:v1`, so refreshing the page restores the conversation in place.
-
-### Inspect ingested chunks (prod)
-
-`GET /api/collections/{name}/chunks` returns the raw chunks ChromaDB has for a collection — useful for verifying ingestion without shelling into the box.
+**Benchmark** (after ingesting both AST + Naive versions of one repo):
 
 ```bash
-BASE=https://<your-render-app>.onrender.com/api
-
-curl "$BASE/collections" | jq                                       # list collections
-curl "$BASE/collections/<name>/chunks?limit=5" | jq                 # first 5 chunks
-curl "$BASE/collections/<name>/chunks?file_path=server.py" | jq     # filter by file
-curl "$BASE/collections/<name>/chunks?chunk_type=function" | jq     # filter by type
-curl "$BASE/collections/<name>/chunks?limit=50&offset=50" | jq      # paginate
-```
-
-Params: `limit` (≤500), `offset`, `file_path`, `chunk_type` (`function|class|doc|code`). Returns `{chunks, total, limit, offset}`.
-
-### CLI (no server required)
-
-```bash
-python ingest.py <owner>/<repo> <ast|naive>
-python agent.py <owner>_<repo>_<mode> "How does error handling work?"
-python tools.py <owner>_<repo>_<mode>   # smoke-test retrieval
+python eval/compare.py <owner>/<repo>     # results land in /benchmarks page
 ```
 
 ---
@@ -146,62 +109,43 @@ python tools.py <owner>_<repo>_<mode>   # smoke-test retrieval
 ## Project layout
 
 ```
-repomind/
-├── server.py              # FastAPI + Inngest (ingest, run_agent, agent_completed, chunks)
-├── inngest_setup.py       # Shared Inngest client (prod/dev via INNGEST_DEV)
-├── auth.py                # Per-request ContextVar overrides for PAT + LLM key
-├── ingest.py              # Repo fetch → chunk → embed → ChromaDB
-├── agent.py               # ReAct loop via httpx → QWEN_GENERATE_URL
+.
+├── server.py              # FastAPI + Inngest functions, REST endpoints
+├── auth.py                # ContextVars: tenant, GitHub PAT, LLM/embed provider+key+model
+├── ingest.py              # Repo walk + Python AST chunker + dispatch
+├── tree_sitter_chunker.py # cAST chunker for 306 languages
+├── agent.py               # ReAct loop with provider switching (vllm/openai/gemini)
 ├── tools.py               # vector_search, get_file, get_recent_commits
-├── prompts.py             # ReAct, query-rewrite, history-compression prompts
-├── logger.py              # Structured JSONL logging → agent_logs.jsonl
-├── render.yaml            # Render web-service spec (free tier)
-├── DEPLOY.md              # Step-by-step Vercel + Render + Inngest Cloud guide
-├── assest/                # Screenshots used in this README
-├── frontend/              # Next.js UI
-│   ├── app/chat/          # Chat page (with localStorage persistence)
-│   ├── app/logs/          # Logs page
-│   ├── app/benchmarks/    # Benchmark results page
-│   ├── app/settings/      # BYO API keys page (GitHub PAT + LLM key)
-│   ├── components/        # Sidebar, MarkdownRenderer (Mermaid), AnimatedTextarea
-│   └── lib/api.ts         # API client + authHeaders() injecting X-Github-Token / X-VLLM-Key
-├── eval/
-│   ├── compare.py         # AST vs naive benchmark (Qwen as judge)
-│   ├── test_queries.py    # Correctness test suite
-│   └── metrics.py         # Latency / token / cost metrics
-├── docs/
-│   └── ARCHITECTURE.md    # System design, chunking, pipeline, challenges
-├── requirements.txt
-├── .env.example
-└── .gitignore
+├── prompts.py             # ReAct + query-rewrite + history-compression
+├── logger.py              # JSONL logging tagged by tenant
+├── inngest_setup.py       # Inngest client (prod via INNGEST_DEV=0)
+├── render.yaml / DEPLOY.md
+├── frontend/
+│   ├── app/{chat,logs,benchmarks,settings}/
+│   ├── components/Sidebar.tsx          # ingest UX + delete + tenant
+│   ├── components/MarkdownRenderer.tsx # Mermaid sanitiser + sizing
+│   └── lib/{api.ts,tenant.ts}          # auth headers + UUID
+├── eval/{compare,test_queries,metrics}.py
+└── docs/ARCHITECTURE.md
 ```
 
 ---
 
 ## Production deployment
 
-End-to-end deploy guide: [`DEPLOY.md`](DEPLOY.md). Summary:
+See [`DEPLOY.md`](DEPLOY.md). Quick map:
 
 | Component | Host | Notes |
-|-----------|------|-------|
-| Frontend | Vercel | Set `NEXT_PUBLIC_API_URL=https://<render-app>.onrender.com/api` |
-| Backend | Render | `render.yaml` provided. Free tier → `chroma_db/` is ephemeral (wiped on redeploy) and the dyno sleeps after 15 min idle |
-| Background jobs | Inngest Cloud | Set `INNGEST_EVENT_KEY` + `INNGEST_SIGNING_KEY`; backend auto-syncs functions on first `PUT /api/inngest` |
-| LLM + embeddings | Modal | Reuse the rag-learning deployment |
+|---|---|---|
+| Frontend | Vercel | Set `NEXT_PUBLIC_API_URL=https://<render>.onrender.com/api` |
+| Backend | Render | `render.yaml`; free tier wipes `chroma_db/` on every deploy |
+| Background jobs | Inngest Cloud | Sync via `curl -X PUT <render>/api/inngest` after deploy |
+| LLM + embeddings | Modal | Shared `qwen_modal.py` deployment |
 
-Extra env vars for prod:
-
-| Variable | Notes |
-|----------|-------|
-| `INNGEST_EVENT_KEY`, `INNGEST_SIGNING_KEY` | Inngest Cloud credentials |
-| `INNGEST_DEV` | `1` for local dev server, omit/`0` in prod |
-| `CHROMA_DB_PATH` | Override `./chroma_db` if mounting persistent disk |
-| `NEXT_PUBLIC_API_URL` | Frontend → backend base URL (Vercel build-time) |
-
-CORS middleware on `server.py` allows the Vercel origin to call the Render backend directly.
+Extra prod env vars: `INNGEST_EVENT_KEY`, `INNGEST_SIGNING_KEY`, `CORS_ORIGINS` (comma-separated whitelist), `CHROMA_DB_PATH` (if mounting persistent disk).
 
 ---
 
 ## Secrets and generated files
 
-`.env`, `chroma_db/`, `agent_logs.jsonl`, `eval_results.jsonl`, and `frontend/public/benchmark_results.json` are gitignored. Never commit them.
+`.env`, `chroma_db/`, `agent_logs.jsonl`, `eval_results.jsonl`, `frontend/public/benchmark_results.json` are gitignored. Never commit them.
