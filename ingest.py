@@ -60,6 +60,25 @@ EXT_LANGUAGE = {
     ".cs":    "csharp",
 }
 
+# Extension → tree-sitter grammar identifier (see tree-sitter-language-pack
+# for the full list of 306 supported languages). When mode="ast" and the file
+# isn't Python/Markdown, ``chunk_file`` looks up this map and invokes the
+# generic cAST chunker. Unmapped extensions fall through to naive_chunk.
+EXT_TO_TREESITTER = {
+    ".js":    "javascript",
+    ".jsx":   "javascript",
+    ".ts":    "typescript",
+    ".tsx":   "tsx",
+    ".dart":  "dart",
+    ".go":    "go",
+    ".rs":    "rust",
+    ".java":  "java",
+    ".kt":    "kotlin",
+    ".swift": "swift",
+    ".rb":    "ruby",
+    ".cs":    "csharp",
+}
+
 # Match an H2 heading only (## , but not ### or deeper).
 H2_PATTERN = re.compile(r"^##(?!#)\s+(.*)$", re.MULTILINE)
 
@@ -374,15 +393,51 @@ def naive_chunk(source: str, file_path: str, language: str) -> list[Chunk]:
 
 
 def chunk_file(path: str, content: str, mode: str) -> list[Chunk]:
+    """Route a file to the right chunker.
+
+    Dispatch (mode="ast"):
+      .md          → extract_markdown_chunks   (heading-based, always)
+      .py          → extract_python_ast_chunks (stdlib ast, rich metadata)
+                     ↳ on SyntaxError, falls through to cast_chunk
+      mapped ext   → cast_chunk via tree-sitter (306 languages, structural)
+                     ↳ on parser error, falls through to naive_chunk
+      else         → naive_chunk                (sliding window fallback)
+
+    Dispatch (mode="naive"):
+      .md          → extract_markdown_chunks
+      else         → naive_chunk
+
+    Tree-sitter import is local so a missing dep (or a wheel that fails to
+    load on some odd platform) doesn't break ingestion entirely — we just
+    fall back to naive for that file.
+    """
     ext = os.path.splitext(path)[1]
     language = EXT_LANGUAGE.get(ext, "text")
-    if ext == ".py" and mode == "ast":
+
+    if ext == ".md":
+        return extract_markdown_chunks(content, path)
+
+    if mode != "ast":
+        return naive_chunk(content, path, language)
+
+    # mode = "ast" ---------------------------------------------------------
+    if ext == ".py":
         chunks = extract_python_ast_chunks(content, path)
         if chunks:
             return chunks
-        return naive_chunk(content, path, "python")
-    if ext == ".md":
-        return extract_markdown_chunks(content, path)
+        # SyntaxError or empty file — try tree-sitter (recovers from errors),
+        # then fall through to naive if that also fails.
+
+    ts_lang = EXT_TO_TREESITTER.get(ext) or ("python" if ext == ".py" else None)
+    if ts_lang:
+        try:
+            from tree_sitter_chunker import cast_chunk
+            chunks = cast_chunk(content, path, ts_lang, max_bytes=CHUNK_CHARS)
+            if chunks:
+                return chunks
+        except Exception as e:
+            print(f"[warn] cast_chunk failed for {path} ({ts_lang}): {e}", flush=True)
+
     return naive_chunk(content, path, language)
 
 
