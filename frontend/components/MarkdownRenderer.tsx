@@ -9,24 +9,54 @@ import type { Components } from "react-markdown";
 const BTN =
   "flex items-center justify-center rounded-md bg-muted border border-border text-foreground hover:bg-accent transition-colors text-sm select-none";
 
+// Characters that, when present in a flowchart node label, make Mermaid choke
+// unless the whole label is wrapped in double quotes. The LLM is instructed to
+// pre-quote these (see prompts.py), but compliance is imperfect — this sanitiser
+// is the safety net so a stray `D[file.py (foo)]` doesn't break the render.
+const FLOWCHART_NEEDS_QUOTING = /[.(){}#',:|/@!?&=+*<>[\]]/;
+
+// One node definition: identifier + opening bracket + content + closing bracket.
+// We handle the three shape syntaxes: square [..], rhombus {..}, round (..).
+// Captures the bracket pair so we can preserve it on rewrite.
+const FLOWCHART_NODE_RE = /([A-Za-z0-9_]+)([[{(])([^\]})\n]*)([\]})])/g;
+
+function sanitizeFlowchartLabels(code: string): string {
+  return code.replace(FLOWCHART_NODE_RE, (full, id, open, label, close) => {
+    const trimmed = label.trim();
+    if (!trimmed) return full;
+    if (trimmed.startsWith('"') && trimmed.endsWith('"')) return full;  // already quoted
+    if (!FLOWCHART_NEEDS_QUOTING.test(trimmed)) return full;            // plain label, no need
+    // Replace any inner double-quotes with single-quotes so the outer "" stays
+    // balanced. Then wrap the cleaned label.
+    const cleaned = trimmed.replace(/"/g, "'");
+    return `${id}${open}"${cleaned}"${close}`;
+  });
+}
+
 // Mermaid classDiagram rejects {} inside member lines (e.g. {super.key} in Dart/Flutter).
 // Strip curly-brace content from member definitions before rendering.
 function sanitizeMermaid(code: string): string {
-  if (!code.trimStart().startsWith("classDiagram")) return code;
-  return code
-    .split("\n")
-    .map((line) => {
-      const t = line.trimStart();
-      // Member lines start with a visibility modifier
-      if (/^[+\-#~]/.test(t)) {
-        return line
-          .replace(/\{[^}]*\}/g, "")   // remove {super.key}, {required}, etc.
-          .replace(/\s+\)/g, ")")       // clean up trailing spaces before )
-          .trimEnd();
-      }
-      return line;
-    })
-    .join("\n");
+  const head = code.trimStart();
+  if (head.startsWith("classDiagram")) {
+    return code
+      .split("\n")
+      .map((line) => {
+        const t = line.trimStart();
+        // Member lines start with a visibility modifier
+        if (/^[+\-#~]/.test(t)) {
+          return line
+            .replace(/\{[^}]*\}/g, "")   // remove {super.key}, {required}, etc.
+            .replace(/\s+\)/g, ")")       // clean up trailing spaces before )
+            .trimEnd();
+        }
+        return line;
+      })
+      .join("\n");
+  }
+  if (head.startsWith("flowchart") || head.startsWith("graph")) {
+    return sanitizeFlowchartLabels(code);
+  }
+  return code;
 }
 
 function MermaidBlock({ code }: { code: string }) {
